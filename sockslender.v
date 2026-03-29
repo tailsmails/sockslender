@@ -31,6 +31,8 @@ mut:
 struct Listener {
 	proto ProxyType
 	addr  string
+	user  string
+	pass  string
 }
 
 struct App {
@@ -82,7 +84,12 @@ fn main() {
 	for i < os.args.len {
 		if os.args[i] == '-l' && i + 1 < os.args.len {
 			node := parse_uri(os.args[i + 1])
-			listeners << Listener{proto: node.proto, addr: node.addr}
+			listeners << Listener{
+				proto: node.proto
+				addr: node.addr
+				user: node.user
+				pass: node.pass
+			}
 			i += 2
 		} else if os.args[i] == '-u' && i + 1 < os.args.len {
 			mut nodes := []Node{}
@@ -96,7 +103,7 @@ fn main() {
 		}
 	}
 	if listeners.len == 0 || chains.len == 0 {
-		eprintln('Usage: ${os.args[0]} -l [proto://]addr -u [proto://][user:pass@]addr[+chain]')
+		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr -u [proto://][user:pass@]addr[+chain]')
 		eprintln('Proto: socks5 (default), http, sni')
 		return
 	}
@@ -123,23 +130,24 @@ fn start_listener(mut app App, li int) {
 		.http { 'HTTP' }
 		.sni { 'SNI' }
 	}
+	auth_tag := if l.user != '' { ' [auth]' } else { '' }
 	mut listener := net.listen_tcp(.ip, l.addr) or {
 		eprintln('[!] Cannot listen ${l.addr}: ${err}')
 		return
 	}
-	println('[*] ${pname} on ${l.addr}')
+	println('[*] ${pname} on ${l.addr}${auth_tag}')
 	for {
 		mut conn := listener.accept() or { continue }
-		proto := l.proto
-		spawn handle_conn(mut app, mut conn, proto)
+		spawn handle_conn(mut app, mut conn, li)
 	}
 }
 
 @[inline]
-fn handle_conn(mut app App, mut client net.TcpConn, proto ProxyType) {
-	match proto {
-		.socks5 { handle_socks5(mut app, mut client) }
-		.http { handle_http(mut app, mut client) }
+fn handle_conn(mut app App, mut client net.TcpConn, li int) {
+	l := app.listeners[li]
+	match l.proto {
+		.socks5 { handle_socks5(mut app, mut client, l) }
+		.http { handle_http(mut app, mut client, l) }
 		.sni { handle_sni(mut app, mut client) }
 	}
 }
@@ -458,7 +466,7 @@ fn do_http_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	}
 }
 
-fn handle_socks5(mut app App, mut client net.TcpConn) {
+fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 	defer { client.close() or {} }
 	client.set_read_timeout(30 * time.second)
 	client.set_write_timeout(30 * time.second)
@@ -472,7 +480,37 @@ fn handle_socks5(mut app App, mut client net.TcpConn) {
 	if gn < needed {
 		read_full(mut client, mut greet, needed) or { return }
 	}
-	client.write([u8(0x05), 0x00]) or { return }
+
+	if l.user != '' {
+		client.write([u8(0x05), 0x02]) or { return }
+
+		mut auth := []u8{len: 513}
+		mut an := read_full(mut client, mut auth, 2) or { return }
+		if auth[0] != 0x01 {
+			client.write([u8(0x01), 0x01]) or {}
+			return
+		}
+		ulen := int(auth[1])
+		need_u := 2 + ulen + 1
+		if an < need_u {
+			an = read_full(mut client, mut auth, need_u) or { return }
+		}
+		plen := int(auth[2 + ulen])
+		need_all := 2 + ulen + 1 + plen
+		if an < need_all {
+			read_full(mut client, mut auth, need_all) or { return }
+		}
+		got_user := auth[2..2 + ulen].bytestr()
+		got_pass := auth[3 + ulen..3 + ulen + plen].bytestr()
+
+		if got_user != l.user || got_pass != l.pass {
+			client.write([u8(0x01), 0x01]) or {}
+			return
+		}
+		client.write([u8(0x01), 0x00]) or { return }
+	} else {
+		client.write([u8(0x05), 0x00]) or { return }
+	}
 
 	mut req := []u8{len: 263}
 	mut rn := read_full(mut client, mut req, 4) or { return }
@@ -546,7 +584,7 @@ fn handle_socks5(mut app App, mut client net.TcpConn) {
 	do_relay(mut client, mut upstream)
 }
 
-fn handle_http(mut app App, mut client net.TcpConn) {
+fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 	defer { client.close() or {} }
 	client.set_read_timeout(30 * time.second)
 	client.set_write_timeout(30 * time.second)
@@ -568,6 +606,26 @@ fn handle_http(mut app App, mut client net.TcpConn) {
 	}
 
 	hdr := acc.bytestr()
+	
+	if l.user != '' {
+		expected := base64.encode_str('${l.user}:${l.pass}')
+		mut authed := false
+		for line in hdr.split('\r\n') {
+			low := line.to_lower()
+			if low.starts_with('proxy-authorization: basic ') {
+				got := line[27..].trim_space()
+				if got == expected {
+					authed = true
+				}
+				break
+			}
+		}
+		if !authed {
+			client.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="proxy"\r\n\r\n'.bytes()) or {}
+			return
+		}
+	}
+
 	lines := hdr.split('\r\n')
 	if lines.len == 0 {
 		return
