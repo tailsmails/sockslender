@@ -40,6 +40,7 @@ mut:
 	listeners  []Listener
 	chains     []Chain
 	rr_counter u64
+	udp_port   u32
 	mu         sync.Mutex
 }
 
@@ -111,6 +112,7 @@ fn main() {
 		listeners: listeners
 		chains: chains
 		rr_counter: 0
+		udp_port: 40000
 	}
 	spawn health_checker(mut app)
 	for li in 0 .. listeners.len {
@@ -559,7 +561,10 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 			return
 		}
 	}
-
+	if cmd == 0x03 {
+		handle_udp_associate(mut app, mut client)
+		return
+	}
 	if cmd != 0x01 {
 		mut f := []u8{len: 10}
 		f[0] = 0x05
@@ -793,4 +798,112 @@ fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool) {
 		dst.write(b[..nr]) or { break }
 	}
 	done <- true
+}
+
+fn handle_udp_associate(mut app App, mut client net.TcpConn) {
+	app.mu.@lock()
+	port := int(app.udp_port)
+	app.udp_port++
+	if app.udp_port > 50000 {
+		app.udp_port = 40000
+	}
+	app.mu.unlock()
+
+	mut relay := net.listen_udp('0.0.0.0:${port}') or {
+		mut f := []u8{len: 10}
+		f[0] = 0x05
+		f[1] = 0x01
+		client.write(f) or {}
+		return
+	}
+	mut out := net.listen_udp('0.0.0.0:0') or {
+		relay.close() or {}
+		mut f := []u8{len: 10}
+		f[0] = 0x05
+		f[1] = 0x01
+		client.write(f) or {}
+		return
+	}
+
+	mut resp := []u8{len: 10}
+	resp[0] = 0x05
+	resp[3] = 0x01
+	resp[8] = u8(u32(port) >> 8)
+	resp[9] = u8(u32(port) & 0xff)
+	client.write(resp) or {
+		relay.close() or {}
+		out.close() or {}
+		return
+	}
+
+	spawn tcp_udp_monitor(mut client, mut relay, mut out)
+
+	relay.set_read_timeout(2 * time.minute)
+	out.set_read_timeout(10 * time.second)
+
+	mut buf := []u8{len: buf_size}
+	mut rbuf := []u8{len: buf_size}
+
+	for {
+		n, from := relay.read(mut buf) or { break }
+		if n < 7 { continue }
+		if buf[2] != 0x00 { continue }
+
+		hdr_len, dest_host, dest_port := parse_udp_socks(buf[..n].clone()) or { continue }
+
+		addrs := net.resolve_addrs('${dest_host}:${dest_port}', net.AddrFamily.ip, net.SocketType.udp) or { continue }
+		if addrs.len == 0 { continue }
+		out.write_to(addrs[0], buf[hdr_len..n].clone()) or { continue }
+
+		rn, _ := out.read(mut rbuf) or { continue }
+		if rn == 0 { continue }
+
+		mut pkt := []u8{cap: hdr_len + rn}
+		pkt << buf[..hdr_len].clone()
+		pkt << rbuf[..rn].clone()
+		relay.write_to(from, pkt) or { continue }
+	}
+}
+
+fn parse_udp_socks(d []u8) !(int, string, int) {
+	if d.len < 7 {
+		return error('short')
+	}
+	match d[3] {
+		0x01 {
+			if d.len < 10 {
+				return error('short4')
+			}
+			return 10, '${d[4]}.${d[5]}.${d[6]}.${d[7]}', int((u32(d[8]) << 8) | u32(d[9]))
+		}
+		0x03 {
+			dl := int(d[4])
+			if d.len < 5 + dl + 2 {
+				return error('shortd')
+			}
+			return 5 + dl + 2, d[5..5 + dl].bytestr(), int((u32(d[5 + dl]) << 8) | u32(d[5 + dl + 1]))
+		}
+		0x04 {
+			if d.len < 22 {
+				return error('short6')
+			}
+			mut p := []string{cap: 8}
+			for j in 0 .. 8 {
+				p << '${(u16(d[4 + j * 2]) << 8) | u16(d[4 + j * 2 + 1]):x}'
+			}
+			return 22, p.join(':'), int((u32(d[20]) << 8) | u32(d[21]))
+		}
+		else {
+			return error('atyp')
+		}
+	}
+}
+
+fn tcp_udp_monitor(mut client net.TcpConn, mut relay net.UdpConn, mut out net.UdpConn) {
+	mut b := []u8{len: 1}
+	for {
+		client.read(mut b) or { break }
+	}
+	relay.close() or {}
+	out.close() or {}
 }
