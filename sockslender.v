@@ -4,9 +4,9 @@ import time
 import sync
 import encoding.base64
 
-const check_interval = 30 * time.second
+const check_interval = 20 * time.second
 const check_timeout = 5 * time.second
-const buf_size = 32768
+const buf_size = 65536
 
 enum ProxyType {
 	socks5
@@ -24,7 +24,8 @@ struct Node {
 struct Chain {
 	nodes []Node
 mut:
-	alive bool
+	alive   bool
+	latency i64
 }
 
 struct Listener {
@@ -81,14 +82,14 @@ fn main() {
 	for i < os.args.len {
 		if os.args[i] == '-l' && i + 1 < os.args.len {
 			node := parse_uri(os.args[i + 1])
-			listeners << Listener{ proto: node.proto, addr: node.addr }
+			listeners << Listener{proto: node.proto, addr: node.addr}
 			i += 2
 		} else if os.args[i] == '-u' && i + 1 < os.args.len {
 			mut nodes := []Node{}
 			for p in os.args[i + 1].split('+') {
 				nodes << parse_uri(p)
 			}
-			chains << Chain{ nodes: nodes, alive: true }
+			chains << Chain{nodes: nodes, alive: true, latency: 0}
 			i += 2
 		} else {
 			i += 1
@@ -108,7 +109,7 @@ fn main() {
 	for li in 0 .. listeners.len {
 		spawn start_listener(mut app, li)
 	}
-	println('[*] ${listeners.len} listener(s), ${chains.len} upstream(s) [round-robin]')
+	println('[*] ${listeners.len} listener(s), ${chains.len} upstream(s) [weighted-latency]')
 	for {
 		time.sleep(1 * time.hour)
 	}
@@ -147,11 +148,17 @@ fn health_checker(mut app App) {
 	for {
 		mut any := false
 		for ci in 0 .. app.chains.len {
+			t0 := time.now()
 			alive := check_chain(app.chains[ci])
+			d := time.now() - t0
+			lat := i64(d) / 1000
 			app.mu.@lock()
 			app.chains[ci].alive = alive
+			if alive {
+				app.chains[ci].latency = lat
+				any = true
+			}
 			app.mu.unlock()
-			if alive { any = true }
 		}
 		if !any {
 			eprintln('[!] All upstreams dead')
@@ -162,7 +169,9 @@ fn health_checker(mut app App) {
 
 @[inline]
 fn check_chain(c Chain) bool {
-	if c.nodes.len == 0 { return false }
+	if c.nodes.len == 0 {
+		return false
+	}
 	n := c.nodes[0]
 	match n.proto {
 		.socks5 { return check_socks5_h(n) }
@@ -187,7 +196,9 @@ fn check_socks5_h(n Node) bool {
 		c.write([u8(0x05), 0x01, 0x02]) or { return false }
 		mut r := []u8{len: 2}
 		c.read(mut r) or { return false }
-		if r[1] != 0x02 { return false }
+		if r[1] != 0x02 {
+			return false
+		}
 		mut a := []u8{cap: 3 + n.user.len + n.pass.len}
 		a << 0x01
 		a << u8(n.user.len)
@@ -222,28 +233,103 @@ fn check_http_h(n Node) bool {
 }
 
 @[inline]
-fn get_active_chain(mut app App) []Node {
+fn pick_chain_order(mut app App) []int {
 	app.mu.@lock()
-	mut alive_idx := []int{cap: app.chains.len}
+	defer { app.mu.unlock() }
+
+	mut idxs := []int{cap: app.chains.len}
 	for ci in 0 .. app.chains.len {
 		if app.chains[ci].alive {
-			alive_idx << ci
+			idxs << ci
 		}
 	}
-	if alive_idx.len == 0 {
-		nodes := app.chains[0].nodes.clone()
-		app.mu.unlock()
-		return nodes
+
+	if idxs.len == 0 {
+		for ci in 0 .. app.chains.len {
+			idxs << ci
+		}
+		return idxs
 	}
-	pick := alive_idx[int(app.rr_counter % u64(alive_idx.len))]
+
+	if idxs.len == 1 {
+		return idxs
+	}
+
+	for i in 1 .. idxs.len {
+		mut j := i
+		for j > 0 {
+			if app.chains[idxs[j]].latency < app.chains[idxs[j - 1]].latency {
+				tmp := idxs[j]
+				idxs[j] = idxs[j - 1]
+				idxs[j - 1] = tmp
+				j--
+			} else {
+				break
+			}
+		}
+	}
+
+	mut weights := []i64{cap: idxs.len}
+	mut total := i64(0)
+	for idx in idxs {
+		lat := app.chains[idx].latency
+		mut w := if lat > 0 { i64(10_000_000) / (lat + 1) } else { i64(1000) }
+		if w < 1 {
+			w = 1
+		}
+		weights << w
+		total += w
+	}
+
+	if total <= 0 {
+		total = 1
+	}
+	pv := i64(app.rr_counter % u64(total))
 	app.rr_counter++
-	nodes := app.chains[pick].nodes.clone()
-	app.mu.unlock()
-	return nodes
+
+	mut first := 0
+	mut cum := i64(0)
+	for i in 0 .. weights.len {
+		cum += weights[i]
+		if pv < cum {
+			first = i
+			break
+		}
+	}
+
+	if first == 0 {
+		return idxs
+	}
+
+	mut result := []int{cap: idxs.len}
+	result << idxs[first]
+	for i in 0 .. idxs.len {
+		if i != first {
+			result << idxs[i]
+		}
+	}
+	return result
+}
+
+fn connect_retry(mut app App, host string, port int) !&net.TcpConn {
+	order := pick_chain_order(mut app)
+	if order.len == 0 {
+		return error('no chains')
+	}
+	for ci in order {
+		app.mu.@lock()
+		nodes := app.chains[ci].nodes.clone()
+		app.mu.unlock()
+		conn := connect_chain(nodes, host, port) or { continue }
+		return conn
+	}
+	return error('all chains failed')
 }
 
 fn connect_chain(chain []Node, host string, port int) !&net.TcpConn {
-	if chain.len == 0 { return error('empty chain') }
+	if chain.len == 0 {
+		return error('empty chain')
+	}
 	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial: ${err}') }
 	conn.set_read_timeout(30 * time.second)
 	conn.set_write_timeout(30 * time.second)
@@ -253,7 +339,9 @@ fn connect_chain(chain []Node, host string, port int) !&net.TcpConn {
 		if i < chain.len - 1 {
 			hp := chain[i + 1].addr.split(':')
 			nh = hp[0]
-			if hp.len > 1 { np = hp[1].int() }
+			if hp.len > 1 {
+				np = hp[1].int()
+			}
 		}
 		match chain[i].proto {
 			.socks5 {
@@ -283,9 +371,13 @@ fn do_socks5_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	}
 	mut gr := []u8{len: 2}
 	read_full(mut c, mut gr, 2)!
-	if gr[0] != 0x05 { return error('not socks5') }
+	if gr[0] != 0x05 {
+		return error('not socks5')
+	}
 	if n.user != '' {
-		if gr[1] != 0x02 { return error('auth rejected') }
+		if gr[1] != 0x02 {
+			return error('auth rejected')
+		}
 		mut a := []u8{cap: 3 + n.user.len + n.pass.len}
 		a << 0x01
 		a << u8(n.user.len)
@@ -295,9 +387,13 @@ fn do_socks5_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 		c.write(a)!
 		mut ar := []u8{len: 2}
 		read_full(mut c, mut ar, 2)!
-		if ar[1] != 0x00 { return error('auth failed') }
+		if ar[1] != 0x00 {
+			return error('auth failed')
+		}
 	} else {
-		if gr[1] != 0x00 { return error('noauth rejected') }
+		if gr[1] != 0x00 {
+			return error('noauth rejected')
+		}
 	}
 	mut req := []u8{cap: 7 + host.len}
 	req << u8(0x05)
@@ -311,18 +407,26 @@ fn do_socks5_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	c.write(req)!
 	mut resp := []u8{len: 263}
 	mut rn := read_full(mut c, mut resp, 4)!
-	if resp[1] != 0x00 { return error('connect fail ${resp[1]}') }
+	if resp[1] != 0x00 {
+		return error('connect fail ${resp[1]}')
+	}
 	mut total := 0
 	match resp[3] {
 		0x01 { total = 10 }
 		0x04 { total = 22 }
 		0x03 {
-			if rn < 5 { rn = read_full(mut c, mut resp, 5)! }
+			if rn < 5 {
+				rn = read_full(mut c, mut resp, 5)!
+			}
 			total = 7 + int(resp[4])
 		}
-		else { return error('bad atyp') }
+		else {
+			return error('bad atyp')
+		}
 	}
-	if rn < total { read_full(mut c, mut resp, total)! }
+	if rn < total {
+		read_full(mut c, mut resp, total)!
+	}
 }
 
 @[inline]
@@ -338,10 +442,16 @@ fn do_http_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	mut acc := []u8{}
 	for {
 		nr := c.read(mut buf) or { return error('read http resp: ${err}') }
-		if nr == 0 { return error('closed') }
+		if nr == 0 {
+			return error('closed')
+		}
 		acc << buf[..nr]
-		if acc.bytestr().contains('\r\n\r\n') { break }
-		if acc.len > 8192 { return error('resp too large') }
+		if acc.bytestr().contains('\r\n\r\n') {
+			break
+		}
+		if acc.len > 8192 {
+			return error('resp too large')
+		}
 	}
 	if !acc.bytestr().contains('200') {
 		return error('CONNECT rejected')
@@ -355,9 +465,13 @@ fn handle_socks5(mut app App, mut client net.TcpConn) {
 
 	mut greet := []u8{len: 257}
 	mut gn := read_full(mut client, mut greet, 2) or { return }
-	if greet[0] != 0x05 { return }
+	if greet[0] != 0x05 {
+		return
+	}
 	needed := 2 + int(greet[1])
-	if gn < needed { read_full(mut client, mut greet, needed) or { return } }
+	if gn < needed {
+		read_full(mut client, mut greet, needed) or { return }
+	}
 	client.write([u8(0x05), 0x00]) or { return }
 
 	mut req := []u8{len: 263}
@@ -372,21 +486,29 @@ fn handle_socks5(mut app App, mut client net.TcpConn) {
 	match atyp {
 		0x01 {
 			rt = 10
-			if rn < rt { rn = read_full(mut client, mut req, rt) or { return } }
+			if rn < rt {
+				rn = read_full(mut client, mut req, rt) or { return }
+			}
 			host = '${req[4]}.${req[5]}.${req[6]}.${req[7]}'
 			port = (u16(req[8]) << 8) | u16(req[9])
 		}
 		0x03 {
-			if rn < 5 { rn = read_full(mut client, mut req, 5) or { return } }
+			if rn < 5 {
+				rn = read_full(mut client, mut req, 5) or { return }
+			}
 			dl := int(req[4])
 			rt = 5 + dl + 2
-			if rn < rt { rn = read_full(mut client, mut req, rt) or { return } }
+			if rn < rt {
+				rn = read_full(mut client, mut req, rt) or { return }
+			}
 			host = req[5..5 + dl].bytestr()
 			port = (u16(req[5 + dl]) << 8) | u16(req[5 + dl + 1])
 		}
 		0x04 {
 			rt = 22
-			if rn < rt { rn = read_full(mut client, mut req, rt) or { return } }
+			if rn < rt {
+				rn = read_full(mut client, mut req, rt) or { return }
+			}
 			mut hp := []string{}
 			for j in 0 .. 8 {
 				v := (u16(req[4 + j * 2]) << 8) | u16(req[4 + j * 2 + 1])
@@ -395,7 +517,9 @@ fn handle_socks5(mut app App, mut client net.TcpConn) {
 			host = hp.join(':')
 			port = (u16(req[20]) << 8) | u16(req[21])
 		}
-		else { return }
+		else {
+			return
+		}
 	}
 
 	if cmd != 0x01 {
@@ -406,8 +530,7 @@ fn handle_socks5(mut app App, mut client net.TcpConn) {
 		return
 	}
 
-	chain := get_active_chain(mut app)
-	mut upstream := connect_chain(chain, host, port) or {
+	mut upstream := connect_retry(mut app, host, port) or {
 		mut f := []u8{len: 10}
 		f[0] = 0x05
 		f[1] = 0x04
@@ -432,27 +555,38 @@ fn handle_http(mut app App, mut client net.TcpConn) {
 	mut acc := []u8{}
 	for {
 		nr := client.read(mut buf) or { return }
-		if nr == 0 { return }
+		if nr == 0 {
+			return
+		}
 		acc << buf[..nr]
-		if acc.bytestr().contains('\r\n\r\n') { break }
-		if acc.len > buf_size { return }
+		if acc.bytestr().contains('\r\n\r\n') {
+			break
+		}
+		if acc.len > buf_size {
+			return
+		}
 	}
 
 	hdr := acc.bytestr()
 	lines := hdr.split('\r\n')
-	if lines.len == 0 { return }
+	if lines.len == 0 {
+		return
+	}
 	parts := lines[0].split(' ')
-	if parts.len < 3 { return }
+	if parts.len < 3 {
+		return
+	}
 	method := parts[0]
 
 	if method == 'CONNECT' {
 		hp := parts[1].split(':')
 		t_host := hp[0]
 		mut t_port := 443
-		if hp.len > 1 { t_port = hp[1].int() }
+		if hp.len > 1 {
+			t_port = hp[1].int()
+		}
 
-		chain := get_active_chain(mut app)
-		mut upstream := connect_chain(chain, t_host, t_port) or {
+		mut upstream := connect_retry(mut app, t_host, t_port) or {
 			client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'.bytes()) or {}
 			return
 		}
@@ -461,7 +595,9 @@ fn handle_http(mut app App, mut client net.TcpConn) {
 		do_relay(mut client, mut upstream)
 	} else {
 		mut rest := parts[1]
-		if rest.starts_with('http://') { rest = rest[7..] }
+		if rest.starts_with('http://') {
+			rest = rest[7..]
+		}
 
 		mut host_part := rest
 		mut path := '/'
@@ -479,8 +615,7 @@ fn handle_http(mut app App, mut client net.TcpConn) {
 			t_port = hp[1].int()
 		}
 
-		chain := get_active_chain(mut app)
-		mut upstream := connect_chain(chain, t_host, t_port) or {
+		mut upstream := connect_retry(mut app, t_host, t_port) or {
 			client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'.bytes()) or {}
 			return
 		}
@@ -489,7 +624,9 @@ fn handle_http(mut app App, mut client net.TcpConn) {
 		mut new_hdr := '${method} ${path} ${parts[2]}\r\n'
 		for li in 1 .. lines.len {
 			ln := lines[li]
-			if ln.to_lower().starts_with('proxy-') { continue }
+			if ln.to_lower().starts_with('proxy-') {
+				continue
+			}
 			new_hdr += '${ln}\r\n'
 		}
 		upstream.write(new_hdr.bytes()) or { return }
@@ -509,14 +646,17 @@ fn handle_sni(mut app App, mut client net.TcpConn) {
 
 	mut buf := []u8{len: buf_size}
 	nr := client.read(mut buf) or { return }
-	if nr == 0 { return }
+	if nr == 0 {
+		return
+	}
 	initial := buf[..nr].clone()
 
 	hostname := extract_sni(initial)
-	if hostname == '' { return }
+	if hostname == '' {
+		return
+	}
 
-	chain := get_active_chain(mut app)
-	mut upstream := connect_chain(chain, hostname, 443) or { return }
+	mut upstream := connect_retry(mut app, hostname, 443) or { return }
 	defer { upstream.close() or {} }
 
 	upstream.write(initial) or { return }
@@ -525,15 +665,25 @@ fn handle_sni(mut app App, mut client net.TcpConn) {
 
 @[inline]
 fn extract_sni(d []u8) string {
-	if d.len < 44 || d[0] != 0x16 || d[5] != 0x01 { return '' }
+	if d.len < 44 || d[0] != 0x16 || d[5] != 0x01 {
+		return ''
+	}
 	mut p := 43
-	if p >= d.len { return '' }
+	if p >= d.len {
+		return ''
+	}
 	p += 1 + int(d[p])
-	if p + 2 > d.len { return '' }
+	if p + 2 > d.len {
+		return ''
+	}
 	p += 2 + ((u16(d[p]) << 8) | u16(d[p + 1]))
-	if p >= d.len { return '' }
+	if p >= d.len {
+		return ''
+	}
 	p += 1 + int(d[p])
-	if p + 2 > d.len { return '' }
+	if p + 2 > d.len {
+		return ''
+	}
 	ext_len := (u16(d[p]) << 8) | u16(d[p + 1])
 	p += 2
 	ext_end := p + ext_len
@@ -556,7 +706,9 @@ fn read_full(mut c net.TcpConn, mut buf []u8, min int) !int {
 	mut total := 0
 	for total < min {
 		n := c.read(mut buf[total..]) or { return err }
-		if n == 0 { return error('closed') }
+		if n == 0 {
+			return error('closed')
+		}
 		total += n
 	}
 	return total
@@ -577,7 +729,9 @@ fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool) {
 	mut b := []u8{len: buf_size}
 	for {
 		nr := src.read(mut b) or { break }
-		if nr == 0 { break }
+		if nr == 0 {
+			break
+		}
 		dst.write(b[..nr]) or { break }
 	}
 	done <- true
