@@ -34,10 +34,10 @@ struct Listener {
 
 struct App {
 mut:
-	listeners []Listener
-	chains    []Chain
-	active    int
-	mu        sync.Mutex
+	listeners  []Listener
+	chains     []Chain
+	rr_counter u64
+	mu         sync.Mutex
 }
 
 @[inline]
@@ -102,13 +102,13 @@ fn main() {
 	mut app := &App{
 		listeners: listeners
 		chains: chains
-		active: 0
+		rr_counter: 0
 	}
 	spawn health_checker(mut app)
 	for li in 0 .. listeners.len {
 		spawn start_listener(mut app, li)
 	}
-	println('[*] ${listeners.len} listener(s), ${chains.len} upstream(s)')
+	println('[*] ${listeners.len} listener(s), ${chains.len} upstream(s) [round-robin]')
 	for {
 		time.sleep(1 * time.hour)
 	}
@@ -153,19 +153,9 @@ fn health_checker(mut app App) {
 			app.mu.unlock()
 			if alive { any = true }
 		}
-		app.mu.@lock()
 		if !any {
 			eprintln('[!] All upstreams dead')
-		} else if !app.chains[app.active].alive {
-			for ci in 0 .. app.chains.len {
-				if app.chains[ci].alive {
-					println('[*] Switch -> chain#${ci}')
-					app.active = ci
-					break
-				}
-			}
 		}
-		app.mu.unlock()
 		time.sleep(check_interval)
 	}
 }
@@ -234,7 +224,20 @@ fn check_http_h(n Node) bool {
 @[inline]
 fn get_active_chain(mut app App) []Node {
 	app.mu.@lock()
-	nodes := app.chains[app.active].nodes.clone()
+	mut alive_idx := []int{cap: app.chains.len}
+	for ci in 0 .. app.chains.len {
+		if app.chains[ci].alive {
+			alive_idx << ci
+		}
+	}
+	if alive_idx.len == 0 {
+		nodes := app.chains[0].nodes.clone()
+		app.mu.unlock()
+		return nodes
+	}
+	pick := alive_idx[int(app.rr_counter % u64(alive_idx.len))]
+	app.rr_counter++
+	nodes := app.chains[pick].nodes.clone()
 	app.mu.unlock()
 	return nodes
 }
