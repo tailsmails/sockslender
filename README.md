@@ -32,6 +32,7 @@ The application can handle both incoming (listening) and outgoing (upstream) con
 *   `socks5` (Default)
 *   `http`
 *   `sni`
+*   `dns`
 
 ### Core Concepts
 
@@ -52,7 +53,7 @@ sockslender [-l [proto://]addr]... -u [proto://][user[:pass]@]addr[+chain] [-x [
 Whenever you define a listener or an upstream, you use the following format:
 `[protocol://][username:password@]host:port`
 
-*   **protocol**: `socks5://`, `http://`, or `sni://`. If omitted, `socks5://` is used by default.
+*   **protocol**: `socks5://`, `http://`, `dns://`, or `sni://`. If omitted, `socks5://` is used by default.
 *   **auth**: `username:password@`. Optional. Used for authenticating with an upstream proxy, or requiring authentication on an exported listener.
 *   **address**: `host:port` (e.g., `127.0.0.1:1080` or `[::1]:1080` for IPv6).
 

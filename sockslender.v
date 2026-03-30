@@ -12,6 +12,7 @@ enum ProxyType {
 	socks5
 	http
 	sni
+	dns
 }
 
 struct Node {
@@ -56,6 +57,9 @@ fn parse_uri(raw string) Node {
 	} else if s.starts_with('sni://') {
 		proto = .sni
 		s = s[6..]
+	} else if s.starts_with('dns://') {
+		proto = .dns
+		s = s[6..]
 	}
 	mut user := ''
 	mut pass := ''
@@ -69,6 +73,9 @@ fn parse_uri(raw string) Node {
 			user = ap[0]
 			pass = ap[1]
 		}
+	}
+	if proto == .dns && !addr.contains(':') {
+		addr += ':53'
 	}
 	return Node{
 		proto: proto
@@ -105,7 +112,7 @@ fn main() {
 	}
 	if listeners.len == 0 || chains.len == 0 {
 		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr -u [proto://][user:pass@]addr[+chain]')
-		eprintln('Proto: socks5 (default), http, sni')
+		eprintln('Proto: socks5 (default), http, sni, dns')
 		return
 	}
 	mut app := &App{
@@ -131,13 +138,31 @@ fn start_listener(mut app App, li int) {
 		.socks5 { 'SOCKS5' }
 		.http { 'HTTP' }
 		.sni { 'SNI' }
+		.dns { 'DNS' }
 	}
 	auth_tag := if l.user != '' { ' [auth]' } else { '' }
-	mut listener := net.listen_tcp(.ip, l.addr) or {
-		eprintln('[!] Cannot listen ${l.addr}: ${err}')
+	
+	if l.proto == .dns {
+		mut listener := net.listen_udp(l.addr) or {
+			eprintln('[!] Cannot listen UDP ${l.addr}: ${err}')
+			return
+		}
+		println('[*] ${pname} on ${l.addr}${auth_tag} (UDP)')
+		for {
+			mut buf := []u8{len: 2048}
+			n, addr := listener.read(mut buf) or { continue }
+			if n > 0 {
+				spawn handle_dns_request(mut app, mut listener, addr, buf[..n].clone())
+			}
+		}
 		return
 	}
-	println('[*] ${pname} on ${l.addr}${auth_tag}')
+	
+	mut listener := net.listen_tcp(.ip, l.addr) or {
+		eprintln('[!] Cannot listen TCP ${l.addr}: ${err}')
+		return
+	}
+	println('[*] ${pname} on ${l.addr}${auth_tag} (TCP)')
 	for {
 		mut conn := listener.accept() or { continue }
 		spawn handle_conn(mut app, mut conn, li)
@@ -151,6 +176,45 @@ fn handle_conn(mut app App, mut client net.TcpConn, li int) {
 		.socks5 { handle_socks5(mut app, mut client, l) }
 		.http { handle_http(mut app, mut client, l) }
 		.sni { handle_sni(mut app, mut client) }
+		.dns {}
+	}
+}
+
+fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Addr, req []u8) {
+	order := pick_chain_order(mut app)
+	if order.len == 0 { return }
+	
+	for ci in order {
+		app.mu.@lock()
+		nodes := app.chains[ci].nodes.clone()
+		app.mu.unlock()
+		
+		if nodes.len == 0 { continue }
+		if nodes[0].proto != .dns { continue }
+		
+		up_addrs := net.resolve_addrs(nodes[0].addr, .ip, .udp) or { continue }
+		if up_addrs.len == 0 { continue }
+		
+		mut out_conn := net.listen_udp('0.0.0.0:0') or { continue }
+		out_conn.set_read_timeout(5 * time.second)
+		
+		out_conn.write_to(up_addrs[0], req) or { 
+			out_conn.close() or {}
+			continue 
+		}
+		
+		mut resp_buf := []u8{len: 2048}
+		rn, _ := out_conn.read(mut resp_buf) or { 
+			out_conn.close() or {}
+			continue 
+		}
+		
+		if rn > 0 {
+			listener.write_to(client_addr, resp_buf[..rn]) or {}
+			out_conn.close() or {}
+			return
+		}
+		out_conn.close() or {}
 	}
 }
 
@@ -187,6 +251,7 @@ fn check_chain(c Chain) bool {
 		.socks5 { return check_socks5_h(n) }
 		.http { return check_http_h(n) }
 		.sni { return check_tcp_h(n.addr) }
+		.dns { return check_dns_h(n) }
 	}
 }
 
@@ -195,6 +260,32 @@ fn check_tcp_h(addr string) bool {
 	mut c := net.dial_tcp(addr) or { return false }
 	c.close() or {}
 	return true
+}
+
+fn check_dns_h(n Node) bool {
+	mut c := net.listen_udp('0.0.0.0:0') or { return false }
+	defer { c.close() or {} }
+	c.set_read_timeout(check_timeout)
+	
+	addrs := net.resolve_addrs(n.addr, .ip, .udp) or { return false }
+	if addrs.len == 0 { return false }
+	
+	query := [u8(0x12), 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			  0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65,
+			  0x03, 0x63, 0x6f, 0x6d, 0x00,
+			  0x00, 0x01, 0x00, 0x01]
+			  
+	c.write_to(addrs[0], query) or { return false }
+	
+	mut buf := []u8{len: 512}
+	n_read, _ := c.read(mut buf) or { return false }
+	
+	if n_read >= 12 && buf[0] == 0x12 && buf[1] == 0x34 {
+		if (buf[2] & 0x80) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 fn check_socks5_h(n Node) bool {
@@ -367,6 +458,7 @@ fn connect_chain(chain []Node, host string, port int) !&net.TcpConn {
 				}
 			}
 			.sni {}
+			.dns {}
 		}
 	}
 	return conn
