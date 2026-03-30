@@ -141,7 +141,7 @@ fn start_listener(mut app App, li int) {
 		.dns { 'DNS' }
 	}
 	auth_tag := if l.user != '' { ' [auth]' } else { '' }
-	
+
 	if l.proto == .dns {
 		mut listener := net.listen_udp(l.addr) or {
 			eprintln('[!] Cannot listen UDP ${l.addr}: ${err}')
@@ -157,7 +157,7 @@ fn start_listener(mut app App, li int) {
 		}
 		return
 	}
-	
+
 	mut listener := net.listen_tcp(.ip, l.addr) or {
 		eprintln('[!] Cannot listen TCP ${l.addr}: ${err}')
 		return
@@ -184,37 +184,52 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 	order := pick_chain_order(mut app)
 	if order.len == 0 { return }
 	
+	mut ans_ch := chan []u8{cap: 3}
+	mut sent := 0
+	
 	for ci in order {
+		if sent >= 3 { break } 
+		
 		app.mu.@lock()
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
 		
-		if nodes.len == 0 { continue }
-		if nodes[0].proto != .dns { continue }
+		if nodes.len == 0 || nodes[0].proto != .dns { continue }
 		
 		up_addrs := net.resolve_addrs(nodes[0].addr, .ip, .udp) or { continue }
 		if up_addrs.len == 0 { continue }
 		
-		mut out_conn := net.listen_udp('0.0.0.0:0') or { continue }
-		out_conn.set_read_timeout(5 * time.second)
+		sent++
 		
-		out_conn.write_to(up_addrs[0], req) or { 
+		spawn fn (addr net.Addr, req []u8, ans_ch chan []u8) {
+			mut out_conn := net.listen_udp('0.0.0.0:0') or { return }
+			out_conn.set_read_timeout(2 * time.second)
+			
+			out_conn.write_to(addr, req) or { 
+				out_conn.close() or {}
+				return 
+			}
+			
+			mut resp_buf := []u8{len: 2048}
+			rn, _ := out_conn.read(mut resp_buf) or { 
+				out_conn.close() or {}
+				return 
+			}
+			
+			if rn > 0 {
+				ans_ch <- resp_buf[..rn].clone()
+			}
 			out_conn.close() or {}
-			continue 
+		}(up_addrs[0], req, ans_ch)
+	}
+
+	if sent == 0 { return }
+
+	select {
+		fastest_response := <-ans_ch {
+			listener.write_to(client_addr, fastest_response) or {}
 		}
-		
-		mut resp_buf := []u8{len: 2048}
-		rn, _ := out_conn.read(mut resp_buf) or { 
-			out_conn.close() or {}
-			continue 
-		}
-		
-		if rn > 0 {
-			listener.write_to(client_addr, resp_buf[..rn]) or {}
-			out_conn.close() or {}
-			return
-		}
-		out_conn.close() or {}
+		2 * time.second {}
 	}
 }
 
@@ -421,7 +436,20 @@ fn connect_retry(mut app App, host string, port int) !&net.TcpConn {
 		app.mu.@lock()
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
-		conn := connect_chain(nodes, host, port) or { continue }
+		
+		conn := connect_chain(nodes, host, port) or { 
+			app.mu.@lock()
+			app.chains[ci].latency += 10000 
+			app.mu.unlock()
+			continue 
+		}
+		
+		app.mu.@lock()
+		if app.chains[ci].latency > 100 {
+			app.chains[ci].latency -= 100
+		}
+		app.mu.unlock()
+		
 		return conn
 	}
 	return error('all chains failed')
