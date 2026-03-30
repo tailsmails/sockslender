@@ -92,20 +92,20 @@ In this example:
 *   Local port 1081 routes strictly to 10.0.0.1.
 *   Local port 1082 routes strictly to 10.0.0.2.
 ```bash
-sockslender -u 10.0.0.1:1080 -x 127.0.0.1:1081 -u 10.0.0.2:1080 -x 127.0.0.1:1082
+sockslender -u 10.0.0.1:1080-x127.0.0.1:1081 -u 10.0.0.2:1080-x127.0.0.1:1082
 ```
 
 ### 6. Exported Listener with Local Authentication
 You can require users to authenticate when connecting to your local exported listener before their traffic is sent to the upstream.
 ```bash
-sockslender -u 192.168.1.50:1080 -x socks5://localuser:localpass@127.0.0.1:1080
+sockslender -u 192.168.1.50:1080-xsocks5://localuser:localpass@127.0.0.1:1080
 ```
 
 ### 7. Complex Mixed Usage
 You can combine general listeners, round-robin upstreams, and exported listeners in a single command.
 
 ```bash
-sockslender -l 127.0.0.1:9000 -u 10.0.0.1:1080 -u 10.0.0.2:1080 -x 127.0.0.1:9002
+sockslender -l 127.0.0.1:9000 -u 10.0.0.1:1080 -u 10.0.0.2:1080-x127.0.0.1:9002
 ```
 In this scenario:
 *   Local port 9000 (`-l`) will load balance between `10.0.0.1` and `10.0.0.2`.

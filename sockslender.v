@@ -27,13 +27,15 @@ struct Chain {
 mut:
 	alive   bool
 	latency i64
+	global  bool
 }
 
 struct Listener {
-	proto ProxyType
-	addr  string
-	user  string
-	pass  string
+	proto     ProxyType
+	addr      string
+	user      string
+	pass      string
+	chain_idx int
 }
 
 struct App {
@@ -45,38 +47,64 @@ mut:
 	mu         sync.Mutex
 }
 
-@[inline]
-fn parse_uri(raw string) Node {
-	mut s := raw
-	mut proto := ProxyType.socks5
-	if s.starts_with('socks5://') {
-		s = s[9..]
-	} else if s.starts_with('http://') {
-		proto = .http
-		s = s[7..]
-	} else if s.starts_with('sni://') {
-		proto = .sni
-		s = s[6..]
-	} else if s.starts_with('dns://') {
-		proto = .dns
-		s = s[6..]
+fn parse_uri(raw string) !Node {
+	if raw.trim_space() == '' {
+		return error('URI is empty')
 	}
+
+	mut s := raw.trim_space()
+	mut proto := ProxyType.socks5
+	
+	if s.contains('://') {
+		parts := s.split('://')
+		if parts.len > 2 {
+			return error('Invalid URI format (multiple "://"): ${raw}')
+		}
+		scheme := parts[0].to_lower()
+		s = parts[1]
+		
+		match scheme {
+			'socks5' { proto = .socks5 }
+			'http' { proto = .http }
+			'sni' { proto = .sni }
+			'dns' { proto = .dns }
+			else { return error('Unknown protocol "${scheme}://" in URI: ${raw}') }
+		}
+	}
+
 	mut user := ''
 	mut pass := ''
 	mut addr := s
+	
 	if s.contains('@') {
 		at_parts := s.split('@')
+		if at_parts.len > 2 {
+			return error('Invalid URI format (multiple "@"): ${raw}')
+		}
 		addr = at_parts[1]
 		auth := at_parts[0]
+		
 		if auth.contains(':') {
 			ap := auth.split(':')
 			user = ap[0]
 			pass = ap[1]
+		} else {
+			user = auth
 		}
 	}
+
+	if addr.trim_space() == '' {
+		return error('Missing address (IP/Hostname) in URI: ${raw}')
+	}
+	
+	if proto != .dns && !addr.contains(':') {
+		return error('Missing port in address (Required for ${proto}): ${addr}')
+	}
+	
 	if proto == .dns && !addr.contains(':') {
 		addr += ':53'
 	}
+
 	return Node{
 		proto: proto
 		addr: addr
@@ -89,43 +117,110 @@ fn main() {
 	mut listeners := []Listener{}
 	mut chains := []Chain{}
 	mut i := 1
+	
 	for i < os.args.len {
 		if os.args[i] == '-l' && i + 1 < os.args.len {
-			node := parse_uri(os.args[i + 1])
+			raw_uri := os.args[i + 1]
+			node := parse_uri(raw_uri) or {
+				eprintln('[!] Listener Error: ${err}')
+				exit(1)
+			}
 			listeners << Listener{
 				proto: node.proto
 				addr: node.addr
 				user: node.user
 				pass: node.pass
+				chain_idx: -1
 			}
 			i += 2
 		} else if os.args[i] == '-u' && i + 1 < os.args.len {
-			mut nodes := []Node{}
-			for p in os.args[i + 1].split('+') {
-				nodes << parse_uri(p)
+			mut current_nodes := []Node{}
+			chain_parts := os.args[i + 1].split('+')
+			
+			for p in chain_parts {
+				part := p.trim_space()
+				if part == '' { continue }
+				
+				if part.starts_with('-x') {
+					addr_part := part[2..].trim_space()
+					if addr_part == '' {
+						eprintln('[!] Upstream Error: Missing address after "-x". Use -x[address] or -x [address]')
+						exit(1)
+					}
+					
+					if current_nodes.len == 0 {
+						eprintln('[!] Upstream Error: Cannot place "-x ${addr_part}" at the very beginning of a chain.')
+						exit(1)
+					}
+					
+					chains << Chain{
+						nodes: current_nodes.clone()
+						alive: true
+						latency: 0
+						global: false
+					}
+					new_chain_idx := chains.len - 1
+					
+					node := parse_uri(addr_part) or {
+						eprintln('[!] "-x" Node Error: ${err}')
+						exit(1)
+					}
+					
+					listeners << Listener{
+						proto: node.proto
+						addr: node.addr
+						user: node.user
+						pass: node.pass
+						chain_idx: new_chain_idx
+					}
+				} else {
+					node := parse_uri(part) or {
+						eprintln('[!] Upstream Node Error: ${err}')
+						exit(1)
+					}
+					current_nodes << node
+				}
 			}
-			chains << Chain{nodes: nodes, alive: true, latency: 0}
+			
+			if current_nodes.len > 0 {
+				chains << Chain{
+					nodes: current_nodes.clone()
+					alive: true
+					latency: 0
+					global: true
+				}
+			} else {
+				eprintln('[!] Upstream Error: Chain is empty after parsing.')
+				exit(1)
+			}
 			i += 2
 		} else {
-			i += 1
+			eprintln('[!] Unknown or incomplete argument: ${os.args[i]}')
+			exit(1)
 		}
 	}
+	
 	if listeners.len == 0 || chains.len == 0 {
-		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr -u [proto://][user:pass@]addr[+chain]')
-		eprintln('Proto: socks5 (default), http, sni, dns')
+		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr:port -u [proto://][user:pass@]addr:port[+-x addr:port][+chain]')
+		eprintln('Valid Protocols: socks5:// (default), http://, sni://, dns://')
+		eprintln('Example: ${os.args[0]} -l 127.0.0.1:1080 -u http://user:pass@1.1.1.1:8080+-x 127.0.0.1:2080+socks5://2.2.2.2:1080')
 		return
 	}
+	
 	mut app := &App{
 		listeners: listeners
 		chains: chains
 		rr_counter: 0
 		udp_port: 40000
 	}
+	
 	spawn health_checker(mut app)
 	for li in 0 .. listeners.len {
 		spawn start_listener(mut app, li)
 	}
-	println('[*] ${listeners.len} listener(s), ${chains.len} upstream(s) [weighted-latency]')
+	
+	println('[*] Parsed successfully. Starting...')
+	println('[*] ${listeners.len} listener(s), ${chains.len} upstream chain(s)')
 	for {
 		time.sleep(1 * time.hour)
 	}
@@ -141,18 +236,19 @@ fn start_listener(mut app App, li int) {
 		.dns { 'DNS' }
 	}
 	auth_tag := if l.user != '' { ' [auth]' } else { '' }
+	bind_tag := if l.chain_idx >= 0 { ' [isolated-chain]' } else { ' [global-lb]' }
 
 	if l.proto == .dns {
 		mut listener := net.listen_udp(l.addr) or {
 			eprintln('[!] Cannot listen UDP ${l.addr}: ${err}')
 			return
 		}
-		println('[*] ${pname} on ${l.addr}${auth_tag} (UDP)')
+		println('[+] ${pname} on ${l.addr}${auth_tag}${bind_tag} (UDP)')
 		for {
 			mut buf := []u8{len: 2048}
 			n, addr := listener.read(mut buf) or { continue }
 			if n > 0 {
-				spawn handle_dns_request(mut app, mut listener, addr, buf[..n].clone())
+				spawn handle_dns_request(mut app, mut listener, addr, buf[..n].clone(), l)
 			}
 		}
 		return
@@ -162,7 +258,7 @@ fn start_listener(mut app App, li int) {
 		eprintln('[!] Cannot listen TCP ${l.addr}: ${err}')
 		return
 	}
-	println('[*] ${pname} on ${l.addr}${auth_tag} (TCP)')
+	println('[+] ${pname} on ${l.addr}${auth_tag}${bind_tag} (TCP)')
 	for {
 		mut conn := listener.accept() or { continue }
 		spawn handle_conn(mut app, mut conn, li)
@@ -175,13 +271,19 @@ fn handle_conn(mut app App, mut client net.TcpConn, li int) {
 	match l.proto {
 		.socks5 { handle_socks5(mut app, mut client, l) }
 		.http { handle_http(mut app, mut client, l) }
-		.sni { handle_sni(mut app, mut client) }
+		.sni { handle_sni(mut app, mut client, l) }
 		.dns {}
 	}
 }
 
-fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Addr, req []u8) {
-	order := pick_chain_order(mut app)
+fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Addr, req []u8, l Listener) {
+	mut order := []int{}
+	if l.chain_idx >= 0 {
+		order << l.chain_idx
+	} else {
+		order = pick_chain_order(mut app)
+	}
+
 	if order.len == 0 { return }
 	
 	mut ans_ch := chan []u8{cap: 3}
@@ -250,7 +352,7 @@ fn health_checker(mut app App) {
 			app.mu.unlock()
 		}
 		if !any {
-			eprintln('[!] All upstreams dead')
+			// eprintln('[!] All upstreams dead')
 		}
 		time.sleep(check_interval)
 	}
@@ -355,14 +457,16 @@ fn pick_chain_order(mut app App) []int {
 
 	mut idxs := []int{cap: app.chains.len}
 	for ci in 0 .. app.chains.len {
-		if app.chains[ci].alive {
+		if app.chains[ci].global && app.chains[ci].alive {
 			idxs << ci
 		}
 	}
 
 	if idxs.len == 0 {
 		for ci in 0 .. app.chains.len {
-			idxs << ci
+			if app.chains[ci].global {
+				idxs << ci
+			}
 		}
 		return idxs
 	}
@@ -427,8 +531,14 @@ fn pick_chain_order(mut app App) []int {
 	return result
 }
 
-fn connect_retry(mut app App, host string, port int) !&net.TcpConn {
-	order := pick_chain_order(mut app)
+fn connect_retry(mut app App, host string, port int, chain_idx int) !&net.TcpConn {
+	mut order := []int{}
+	if chain_idx >= 0 {
+		order << chain_idx
+	} else {
+		order = pick_chain_order(mut app)
+	}
+
 	if order.len == 0 {
 		return error('no chains')
 	}
@@ -693,7 +803,7 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 		return
 	}
 
-	mut upstream := connect_retry(mut app, host, port) or {
+	mut upstream := connect_retry(mut app, host, port, l.chain_idx) or {
 		mut f := []u8{len: 10}
 		f[0] = 0x05
 		f[1] = 0x04
@@ -769,7 +879,7 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 			t_port = hp[1].int()
 		}
 
-		mut upstream := connect_retry(mut app, t_host, t_port) or {
+		mut upstream := connect_retry(mut app, t_host, t_port, l.chain_idx) or {
 			client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'.bytes()) or {}
 			return
 		}
@@ -798,7 +908,7 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 			t_port = hp[1].int()
 		}
 
-		mut upstream := connect_retry(mut app, t_host, t_port) or {
+		mut upstream := connect_retry(mut app, t_host, t_port, l.chain_idx) or {
 			client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'.bytes()) or {}
 			return
 		}
@@ -823,7 +933,7 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 	}
 }
 
-fn handle_sni(mut app App, mut client net.TcpConn) {
+fn handle_sni(mut app App, mut client net.TcpConn, l Listener) {
 	defer { client.close() or {} }
 	client.set_read_timeout(30 * time.second)
 
@@ -839,7 +949,7 @@ fn handle_sni(mut app App, mut client net.TcpConn) {
 		return
 	}
 
-	mut upstream := connect_retry(mut app, hostname, 443) or { return }
+	mut upstream := connect_retry(mut app, hostname, 443, l.chain_idx) or { return }
 	defer { upstream.close() or {} }
 
 	upstream.write(initial) or { return }
