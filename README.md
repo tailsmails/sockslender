@@ -197,5 +197,30 @@ The `-v` (Verbose) flag provides deep visibility into the raw data flowing throu
 
 ---
 
+### 5. Task Manager & Background Runner (`-r?...?`)
+
+This feature turns the application into a unified proxy ecosystem manager. Instead of opening multiple terminal tabs to run external tools (like Tor, Xray, or custom proxies), you can spawn them directly from within the application. 
+
+The application acts as a parent process. **If the main application is closed, crashes, or receives a `Ctrl+C` (SIGINT), all background child processes are automatically and forcefully terminated**, ensuring no zombie processes are left running on your system.
+
+**Syntax:**
+*   Commands are enclosed between `?` and `?`.
+*   Multiple distinct applications are separated by a comma `,`.
+*   Arguments for each application are separated by standard spaces.
+
+**Example Usage:**
+```bash
+# Run Tor on port 9050 and a custom proxy tool on port 8080 in the background
+./sockslender -r?"tor --SocksPort 9050","./myproxyapp -p 8080"? -l 127.0.0.1:1080 -u 127.0.0.1:9050
+```
+
+**What happens in the background:**
+1. The app parses the `-r` flag and spawns `tor` and `myproxyapp` asynchronously.
+2. It prints their active Process IDs (PIDs) to the console.
+3. It starts its own listeners (`-l`) and routes traffic to them.
+4. Upon exit, a `defer` block triggers `signal_kill()` on all managed PIDs, cleaning up the environment perfectly.
+
+---
+
 ## License
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)

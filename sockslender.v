@@ -223,6 +223,19 @@ fn parse_uri(raw string) !Node {
 }
 
 fn main() {
+	mut child_procs := []&os.Process{}
+	defer {
+		if child_procs.len > 0 {
+			println('\n[*] Shutting down... Terminating ${child_procs.len} background task(s).')
+			for mut p in child_procs {
+				if p.is_alive() {
+					p.signal_kill()
+					p.wait()
+					p.close()
+				}
+			}
+		}
+	}
 	mut listeners := []Listener{}
 	mut chains := []Chain{}
 	mut macros := map[string][][]Node{}
@@ -247,6 +260,26 @@ fn main() {
 				listeners << Listener{ proto: node.proto, addr: node.addr, user: node.user, pass: node.pass, chain_idxs: [], is_global: true }
 			}
 			i += 2
+		} else if arg.starts_with('-r?') && arg.ends_with('?') {
+			raw_cmds := arg[3..arg.len-1]
+			cmds := raw_cmds.split(',')
+			
+			for c in cmds {
+				cmd_clean := c.trim_space()
+				if cmd_clean == '' { continue }
+				
+				parts := cmd_clean.split(' ').filter(it != '')
+				if parts.len > 0 {
+					mut p := os.new_process(parts[0])
+					if parts.len > 1 {
+						p.set_args(parts[1..])
+					}
+					p.run()
+					child_procs << p
+					println('[+] Started background task: ${parts[0]} (PID: ${p.pid})')
+				}
+			}
+			i++
 		} else if (arg == '-u' || arg == '-i') && i + 1 < os.args.len {
 			is_upstream := arg == '-u'
 			chain_parts := os.args[i + 1].split('+')
