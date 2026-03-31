@@ -2,114 +2,103 @@
 
 A lightweight, blazing-fast SOCKS5 proxy failover tool written in [V](https://vlang.io/).
 
-Focused on one core objective: taking multiple SOCKS5 upstream proxies and exposing a single, highly available local SOCKS5 proxy. It dynamically monitors the health of all upstreams and seamlessly routes your SOCKS5 traffic through the active, healthy node.
+Focused on one core objective: taking multiple SOCKS5/HTTP/... upstream proxies and exposing a single, highly available local proxy. It dynamically monitors the health of all upstreams and seamlessly routes your SOCKS5 traffic through the active, healthy node.
 
 ## Quick start (copy - paste - enter)
 ```sh
 apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/sockslender && cd sockslender && v -enable-globals -prod sockslender.v -o sockslender && ln -sf $(pwd)/sockslender $PREFIX/bin/sockslender && sockslender
 ```
 
-## Installation
+## Build
 
-First, ensure you have the [V Compiler](https://github.com/vlang/v) installed.
-
-Clone the repository and compile the binary with production optimizations:
+To compile the binary from source:
 
 ```bash
-git clone https://github.com/tailsmails/sockslender
-cd sockslender
-v -prod sockslender.v -o sockslender
+v .
 ```
 
-sockslender is a lightweight, multi-protocol network proxy relayer and load balancer. It allows you to create local proxy listeners that forward traffic through one or multiple upstream proxies, with support for proxy chaining, round-robin load balancing, and automated health checks.
+## Protocol Support
 
-## How It Works
+- Listeners: SOCKS5, HTTP, SNI, DNS
+- Upstreams: SOCKS5, HTTP, DNS
 
-At its core, sockslender acts as a middleman between your applications and remote proxy servers. 
+## Core Usage Examples
 
-### Supported Protocols
-The application can handle both incoming (listening) and outgoing (upstream) connections using the following protocols:
-*   `socks5` (Default)
-*   `http`
-*   `sni`
-*   `dns`
-
-### Core Concepts
-
-1.  **Listeners (`-l`)**: These are local ports that sockslender opens on your machine. Your local applications will connect to these listeners. Traffic entering any general listener is distributed across all available upstream proxies using a round-robin algorithm.
-2.  **Upstreams (`-u`)**: These are the remote proxy servers you want to route your traffic through. You can specify one or multiple upstreams.
-3.  **Health Checking**: sockslender automatically tests the connection to all defined upstreams every 30 seconds. If an upstream dies or times out, it is temporarily removed from the load-balancing rotation until it becomes responsive again.
-4.  **Chaining**: You can chain multiple proxies together. Traffic will be routed from the listener to Proxy A, then from Proxy A to Proxy B, and finally to the destination.
-5.  **Exported Listeners (`-x`)**: Unlike general listeners (`-l`), an exported listener routes traffic *strictly* to the specific upstream defined immediately before it in the command line. This allows you to expose specific remote proxies on specific local ports, bypassing the load balancer. Exported listeners also support setting up local authentication.
-
-## Command Line Usage
-
-### General Syntax
+### Basic Proxy Chaining
+Start a SOCKS5 listener that tunnels through an HTTP proxy.
 ```bash
-sockslender [-l [proto://]addr]... -u [proto://][user[:pass]@]addr[+chain] [-x [proto://][user[:pass]@]addr]...
+./sockslender -l 127.0.0.1:1080 -u http://user:pass@1.2.3.4:8080
 ```
 
-### URI Format
-Whenever you define a listener or an upstream, you use the following format:
-`[protocol://][username:password@]host:port`
-
-*   **protocol**: `socks5://`, `http://`, `dns://`, or `sni://`. If omitted, `socks5://` is used by default.
-*   **auth**: `username:password@`. Optional. Used for authenticating with an upstream proxy, or requiring authentication on an exported listener.
-*   **address**: `host:port` (e.g., `127.0.0.1:1080` or `[::1]:1080` for IPv6).
-
----
-
-## Examples
-
-### 1. Basic Proxy Forwarding
-Listen locally on port 1080 (SOCKS5) and forward all traffic to a remote SOCKS5 proxy at 192.168.1.50:1080.
+### Multi-Hop Tunneling
+Chain multiple SOCKS5 proxies together.
 ```bash
-sockslender -l 127.0.0.1:1080 -u 192.168.1.50:1080
+./sockslender -l 127.0.0.1:1080 -u socks5://1.1.1.1:1080+socks5://2.2.2.2:1080+socks5://3.3.3.3:1080
 ```
 
-### 2. Protocol Translation (HTTP to SOCKS5)
-Listen locally as an HTTP proxy, but forward the traffic through an upstream SOCKS5 proxy that requires authentication.
+### Port Overloading (Failover and Load Balancing)
+Map a single local port to multiple upstream paths. The program automatically selects the healthiest and fastest path.
 ```bash
-sockslender -l http://127.0.0.1:8080 -u socks5://user:secret@192.168.1.50:1080
+./sockslender \
+  -u socks5://primary_server:1080+-x 127.0.0.1:1111 \
+  -u socks5://backup_server:1080+-x 127.0.0.1:1111
 ```
 
-### 3. Load Balancing (Round-Robin)
-Open one local SOCKS5 port, and distribute the incoming traffic evenly across three different upstream SOCKS5 proxies. sockslender will actively monitor their health.
+### Snapshot Macros
+Define complex chains once and reuse them as named snapshots (uppercase names) to avoid redundant port usage or typing.
+
+Define a base path and extend it:
 ```bash
-sockslender -l 127.0.0.1:1080 -u 10.0.0.1:1080 -u 10.0.0.2:1080 -u 10.0.0.3:1080
+./sockslender \
+  -u 1.1.1.1:1080+2.2.2.2:1080+-x MY_CORE_PATH \
+  -u MY_CORE_PATH+3.3.3.3:1080 \
+  -l 127.0.0.1:8080
 ```
 
-### 4. Proxy Chaining
-Route traffic through multiple proxies sequentially. Use the `+` symbol to define the chain. Traffic will go from the local listener -> 10.0.0.1 -> 10.0.0.2 -> Final Destination.
+Multiple entry points using the same snapshot:
 ```bash
-sockslender -l 127.0.0.1:1080 -u 10.0.0.1:1080+10.0.0.2:1080
+./sockslender \
+  -u socks5://proxy_provider:1080+-x DISGUISE \
+  -u DISGUISE+target_a:1080+-x 127.0.0.1:2001 \
+  -u DISGUISE+target_b:1080+-x 127.0.0.1:2002
 ```
 
-### 5. Using Exported Listeners
-If you want to expose specific upstreams to specific local ports without mixing them in a load balancer, use the `-x` flag. The `-x` flag always attaches itself to the `-u` flag defined right before it.
-
-In this example:
-*   Local port 1081 routes strictly to 10.0.0.1.
-*   Local port 1082 routes strictly to 10.0.0.2.
+### SNI Proxying
+Transparently route HTTPS traffic based on Server Name Indication.
 ```bash
-sockslender -u 10.0.0.1:1080+-x127.0.0.1:1081 -u 10.0.0.2:1080+-x127.0.0.1:1082
+./sockslender -l sni://0.0.0.0:443 -u http://1.2.3.4:8080
 ```
 
-### 6. Exported Listener with Local Authentication
-You can require users to authenticate when connecting to your local exported listener before their traffic is sent to the upstream.
+### DNS Load Balancing
+Run a local DNS server that queries multiple upstream DNS servers simultaneously and returns the fastest response.
 ```bash
-sockslender -u 192.168.1.50:1080+-xsocks5://localuser:localpass@127.0.0.1:1080
+./sockslender -l dns://127.0.0.1:53 -u dns://8.8.8.8:53+dns://1.1.1.1:53
 ```
 
-### 7. Complex Mixed Usage
-You can combine general listeners, round-robin upstreams, and exported listeners in a single command.
+## Advanced Logic
 
+### Global vs Isolated Routing
+- If a chain ends with `-x [address]`, the listener on that address only uses the upstream(s) it is specifically attached to.
+- If a listener is defined with `-l [address]`, it acts as a global entry point and can load balance across all global `-u` chains based on real-time latency checks.
+
+### Health Checks
+The engine performs background health checks every 20 seconds. If an upstream fails, it is temporarily deprioritized. Traffic is automatically rerouted to the next available hop in the overloaded group or global pool.
+
+## Command Line Arguments
+
+- `-l`: Define a global listener (Protocol, Address, Auth).
+- `-u`: Define an upstream chain. Use `+` to chain nodes and `-x` to bind the current chain to a specific port or snapshot name.
+
+## Examples of -x Routing
+
+Route port 1111 to either server A or server B (Fastest wins):
 ```bash
-sockslender -l 127.0.0.1:9000 -u 10.0.0.1:1080 -u 10.0.0.2:1080+-x127.0.0.1:9002
+./sockslender -u server_a:1080+-x 127.0.0.1:1111 -u server_b:1080+-x 127.0.0.1:1111
 ```
-In this scenario:
-*   Local port 9000 (`-l`) will load balance between `10.0.0.1` and `10.0.0.2`.
-*   Local port 9002 (`-x`) is tied only to `10.0.0.2` (because it was declared immediately after it).
 
+Define a named group and use it later:
+```bash
+./sockslender -u provider1:1080+-x GROUP_A -u provider2:1080+-x GROUP_A -u GROUP_A+final_hop:1080 -l 127.0.0.1:1080
+```
 ## License
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
