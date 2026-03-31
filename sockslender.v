@@ -49,6 +49,16 @@ mut:
 	mu         sync.Mutex
 }
 
+fn is_snapshot_name(s string) bool {
+	if s == '' { return false }
+	for c in s {
+		if !((c >= `A` && c <= `Z`) || (c >= `0` && c <= `9`) || c == `_`) {
+			return false
+		}
+	}
+	return true
+}
+
 fn parse_uri(raw string) !Node {
 	if raw.trim_space() == '' {
 		return error('URI is empty')
@@ -118,6 +128,8 @@ fn parse_uri(raw string) !Node {
 fn main() {
 	mut listeners := []Listener{}
 	mut chains := []Chain{}
+	mut macros := map[string][][]Node{}
+	
 	mut i := 1
 
 	for i < os.args.len {
@@ -149,77 +161,117 @@ fn main() {
 			}
 			i += 2
 		} else if os.args[i] == '-u' && i + 1 < os.args.len {
-			mut current_nodes := []Node{}
 			chain_parts := os.args[i + 1].split('+')
+			mut current_paths := [][]Node{}
+			current_paths << []Node{}
 			
 			for p in chain_parts {
 				part := p.trim_space()
 				if part == '' { continue }
 				
 				if part.starts_with('-x') {
-					addr_part := part[2..].trim_space()
-					if addr_part == '' {
-						eprintln('[!] Upstream Error: Missing address after "-x".')
+					name := part[2..].trim_space()
+					if name == '' {
+						eprintln('[!] Upstream Error: Missing address or snapshot name after "-x".')
 						exit(1)
 					}
 					
-					if current_nodes.len == 0 {
+					if current_paths[0].len == 0 {
 						eprintln('[!] Upstream Error: Cannot place "-x" at the beginning of chain.')
 						exit(1)
 					}
 					
-					chains << Chain{
-						nodes: current_nodes.clone()
-						alive: true
-						latency: 0
-						global: false
-					}
-					new_chain_idx := chains.len - 1
-					node := parse_uri(addr_part) or {
-						eprintln('[!] "-x" Node Error: ${err}')
-						exit(1)
-					}
-					
-					mut existing_idx := -1
-					for j in 0 .. listeners.len {
-						if listeners[j].addr == node.addr && listeners[j].proto == node.proto {
-							existing_idx = j
-							break
+					if is_snapshot_name(name) {
+						if name !in macros {
+							macros[name] = [][]Node{}
 						}
-					}
-					if existing_idx >= 0 {
-						if new_chain_idx !in listeners[existing_idx].chain_idxs {
-							listeners[existing_idx].chain_idxs << new_chain_idx
+						for path in current_paths {
+							if path.len > 0 {
+								macros[name] << path.clone()
+							}
 						}
 					} else {
-						listeners << Listener{
-							proto: node.proto
-							addr: node.addr
-							user: node.user
-							pass: node.pass
-							chain_idxs: [new_chain_idx]
-							is_global: false
+						node := parse_uri(name) or {
+							eprintln('[!] "-x" Node Error: ${err}')
+							exit(1)
+						}
+						
+						mut new_chain_idxs := []int{}
+						for path in current_paths {
+							if path.len > 0 {
+								chains << Chain{
+									nodes: path.clone()
+									alive: true
+									latency: 0
+									global: false
+								}
+								new_chain_idxs << (chains.len - 1)
+							}
+						}
+						
+						mut existing_idx := -1
+						for j in 0 .. listeners.len {
+							if listeners[j].addr == node.addr && listeners[j].proto == node.proto {
+								existing_idx = j
+								break
+							}
+						}
+						if existing_idx >= 0 {
+							for cidx in new_chain_idxs {
+								if cidx !in listeners[existing_idx].chain_idxs {
+									listeners[existing_idx].chain_idxs << cidx
+								}
+							}
+						} else {
+							listeners << Listener{
+								proto: node.proto
+								addr: node.addr
+								user: node.user
+								pass: node.pass
+								chain_idxs: new_chain_idxs
+								is_global: false
+							}
 						}
 					}
 				} else {
-					node := parse_uri(part) or {
-						eprintln('[!] Upstream Node Error: ${err}')
-						exit(1)
+					if is_snapshot_name(part) {
+						if part in macros {
+							mut next_paths := [][]Node{}
+							for path in current_paths {
+								for macro_path in macros[part] {
+									mut new_path := path.clone()
+									for n in macro_path {
+										new_path << n
+									}
+									next_paths << new_path
+								}
+							}
+							current_paths = next_paths.clone()
+						} else {
+							eprintln('[!] Upstream Error: Snapshot "${part}" is used before definition or does not exist.')
+							exit(1)
+						}
+					} else {
+						node := parse_uri(part) or {
+							eprintln('[!] Upstream Node Error: ${err}')
+							exit(1)
+						}
+						for mut path in current_paths {
+							path << node
+						}
 					}
-					current_nodes << node
 				}
 			}
 			
-			if current_nodes.len > 0 {
-				chains << Chain{
-					nodes: current_nodes.clone()
-					alive: true
-					latency: 0
-					global: true
+			for path in current_paths {
+				if path.len > 0 {
+					chains << Chain{
+						nodes: path.clone()
+						alive: true
+						latency: 0
+						global: true
+					}
 				}
-			} else {
-				eprintln('[!] Upstream Error: Chain is empty.')
-				exit(1)
 			}
 			i += 2
 		} else {
@@ -229,7 +281,7 @@ fn main() {
 	}
 
 	if listeners.len == 0 || chains.len == 0 {
-		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr:port -u [proto://][user:pass@]addr:port[+-x addr:port][+chain]')
+		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr:port -u [proto://][user:pass@]addr:port[+-x addr_or_SNAPSHOT][+chain]')
 		return
 	}
 
@@ -246,7 +298,7 @@ fn main() {
 	}
 
 	println('[*] Parsed successfully. Starting...')
-	println('[*] ${listeners.len} listener(s), ${chains.len} upstream chain(s)')
+	println('[*] ${listeners.len} listener(s), ${chains.len} active routing chain(s), ${macros.len} internal snapshot(s)')
 	for {
 		time.sleep(1 * time.hour)
 	}
@@ -490,7 +542,7 @@ fn pick_best_from_list(mut app App, allowed_idxs []int) []int {
 	if alive_idxs.len <= 1 {
 		return if alive_idxs.len == 1 { alive_idxs } else { allowed_idxs.clone() }
 	}
-	
+
 	for i in 1 .. alive_idxs.len {
 		mut j := i
 		for j > 0 {
@@ -713,9 +765,7 @@ fn do_http_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	mut acc := []u8{}
 	for {
 		nr := c.read(mut buf) or { return error('read http resp: ${err}') }
-		if nr == 0 {
-			return error('closed')
-		}
+		if nr == 0 { return error('closed') }
 		acc << buf[..nr]
 		if acc.bytestr().contains('\r\n\r\n') { break }
 		if acc.len > 8192 { return error('resp too large') }
