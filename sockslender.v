@@ -69,6 +69,7 @@ struct Listener {
 
 struct App {
 mut:
+	id         int
 	listeners  []Listener
 	chains     []Chain
 	rr_counter u64
@@ -236,161 +237,210 @@ fn main() {
 			}
 		}
 	}
-	mut listeners := []Listener{}
-	mut chains := []Chain{}
-	mut macros := map[string][][]Node{}
-	mut global_outbound_str := ''
-	mut i := 1
-	mut verbose := false
+	
+	mut raw_args := os.args[1..].clone()
+	mut boxes_args := [][]string{}
+	mut current_box := []string{}
 
-	for i < os.args.len {
-		arg := os.args[i]
-		if arg == '-v' {
-			verbose = true; i++; continue
-		} else if arg == '-l' && i + 1 < os.args.len {
-			raw_uri := os.args[i + 1]
-			node := parse_uri(raw_uri) or { exit(1) }
-			mut existing_idx := -1
-			for j in 0 .. listeners.len {
-				if listeners[j].addr == node.addr && listeners[j].proto == node.proto { existing_idx = j; break }
+	for arg in raw_args {
+		if arg == '::' {
+			if current_box.len > 0 {
+				boxes_args << current_box
+				current_box = []
 			}
-			if existing_idx >= 0 {
-				listeners[existing_idx].is_global = true
-			} else {
-				listeners << Listener{ proto: node.proto, addr: node.addr, user: node.user, pass: node.pass, chain_idxs: [], is_global: true }
-			}
-			i += 2
-		} else if arg.starts_with('-r?') && arg.ends_with('?') {
-			raw_cmds := arg[3..arg.len-1]
-			cmds := raw_cmds.split(',')
-			
-			for c in cmds {
-				cmd_clean := c.trim_space()
-				if cmd_clean == '' { continue }
-				
-				parts := cmd_clean.split(' ').filter(it != '')
-				if parts.len > 0 {
-					mut p := os.new_process(parts[0])
-					if parts.len > 1 {
-						p.set_args(parts[1..])
-					}
-					p.run()
-					child_procs << p
-					println('[+] Started background task: ${parts[0]} (PID: ${p.pid})')
-				}
-			}
-			i++
-		} else if (arg == '-u' || arg == '-i') && i + 1 < os.args.len {
-			is_upstream := arg == '-u'
-			chain_parts := os.args[i + 1].split('+')
-			mut current_paths := [][]Node{}; current_paths << []Node{}
-			
-			for p in chain_parts {
-				part := p.trim_space()
-				if part == '' { continue }
-				if part.starts_with('-x') {
-					name := part[2..].trim_space()
-					if name == '' || current_paths[0].len == 0 { exit(1) }
-					if is_snapshot_name(name) {
-						if name !in macros { macros[name] = [][]Node{} }
-						for path in current_paths {
-							if path.len > 0 { macros[name] << path.clone() }
-						}
-					} else {
-						node := parse_uri(name) or { exit(1) }
-						mut new_chain_idxs := []int{}
-						for path in current_paths {
-							if path.len > 0 {
-								chains << Chain{ nodes: path.clone(), alive: true, global: false }
-								new_chain_idxs << (chains.len - 1)
-							}
-						}
-						mut existing_idx := -1
-						for j in 0 .. listeners.len {
-							if listeners[j].addr == node.addr && listeners[j].proto == node.proto { existing_idx = j; break }
-						}
-						if existing_idx >= 0 {
-							for cidx in new_chain_idxs {
-								if cidx !in listeners[existing_idx].chain_idxs { listeners[existing_idx].chain_idxs << cidx }
-							}
-						} else {
-							listeners << Listener{ proto: node.proto, addr: node.addr, user: node.user, pass: node.pass, chain_idxs: new_chain_idxs, is_global: false }
-						}
-					}
-				} else {
-					if is_snapshot_name(part) {
-						if part in macros {
-							mut next_paths := [][]Node{}
-							for path in current_paths {
-								for macro_path in macros[part] {
-									mut new_path := path.clone()
-									for n in macro_path { new_path << n }
-									next_paths << new_path
-								}
-							}
-							current_paths = next_paths.clone()
-						} else { exit(1) }
-					} else {
-						node := parse_uri(part) or { exit(1) }
-						for mut path in current_paths { path << node }
-					}
-				}
-			}
-			if is_upstream {
-				for path in current_paths {
-					if path.len > 0 { chains << Chain{ nodes: path.clone(), alive: true, global: true } }
-				}
-			}
-			i += 2
-		} else if arg == '-o' && i + 1 < os.args.len {
-			global_outbound_str = os.args[i+1]
-			i += 2
 		} else {
-			eprintln('[!] Unknown argument: ${os.args[i]}'); exit(1)
+			current_box << arg
 		}
 	}
-
-	if global_outbound_str != '' {
-		mut out_paths := [][]Node{}; out_paths << []Node{}
-		for p in global_outbound_str.split('+') {
-			part := p.trim_space()
-			if part == '' { continue }
-			if is_snapshot_name(part) {
-				if part in macros {
-					mut next_paths := [][]Node{}
-					for path in out_paths {
-						for macro_path in macros[part] {
-							mut np := path.clone()
-							for n in macro_path { np << n }
-							next_paths << np
-						}
-					}
-					out_paths = next_paths.clone()
-				} else { exit(1) }
-			} else {
-				node := parse_uri(part) or { exit(1) }
-				for mut path in out_paths { path << node }
-			}
-		}
-		if out_paths.len > 0 && out_paths[0].len > 0 {
-			single_out := out_paths[0] 
-			for mut c in chains {
-				for n in single_out { c.nodes << n }
-			}
-		}
+	if current_box.len > 0 {
+		boxes_args << current_box
 	}
 
-	if listeners.len == 0 || chains.len == 0 {
-		eprintln('Usage: ${os.args[0]} [-v] -l addr:port -u/-i addr:port[+-x SNAPSHOT] [-o OUTBOUND]')
+	if boxes_args.len == 0 {
+		eprintln('Usage: ${os.args[0]} [-v] -l addr:port -u addr:port [:: -l addr:port ...]')
 		return
 	}
 
-	mut app := &App{ listeners: listeners, chains: chains, rr_counter: 0, udp_port: 40000, verbose: verbose }
-	spawn health_checker(mut app)
-	for li in 0 .. listeners.len { spawn start_listener(mut app, li) }
+	mut apps := []&App{}
+	
+	for box_idx, box_args in boxes_args {
+		mut listeners := []Listener{}
+		mut chains := []Chain{}
+		mut macros := map[string][][]Node{}
+		mut global_outbound_str := ''
+		mut verbose := false
+		mut i := 0
 
-	println('[*] Parsed successfully. Starting...')
-	if verbose { println('[*] VERBOSE mode enabled. Traffic and scripts will be logged.') }
+		for i < box_args.len {
+			arg := box_args[i]
+			
+			if arg == '-v' {
+				verbose = true
+				i++
+				continue
+			} else if arg.starts_with('-r?') && arg.ends_with('?') {
+				raw_cmds := arg[3..arg.len-1]
+				cmds := raw_cmds.split(',')
+				for c in cmds {
+					cmd_clean := c.trim_space()
+					if cmd_clean == '' { continue }
+					parts := cmd_clean.split(' ').filter(it != '')
+					if parts.len > 0 {
+						mut p := os.new_process(parts[0])
+						if parts.len > 1 { p.set_args(parts[1..]) }
+						p.run()
+						child_procs << p
+						println('[*] [Global] Started background task: ${parts[0]} (PID: ${p.pid})')
+					}
+				}
+				i++
+				continue
+			} else if arg == '-l' && i + 1 < box_args.len {
+				raw_uri := box_args[i + 1]
+				node := parse_uri(raw_uri) or { eprintln('[!] [Box ${box_idx+1}] Listener Error: ${err}'); exit(1) }
+				
+				mut existing_idx := -1
+				for j in 0 .. listeners.len {
+					if listeners[j].addr == node.addr && listeners[j].proto == node.proto { existing_idx = j; break }
+				}
+				if existing_idx >= 0 {
+					listeners[existing_idx].is_global = true
+				} else {
+					listeners << Listener{ proto: node.proto, addr: node.addr, user: node.user, pass: node.pass, chain_idxs: [], is_global: true }
+				}
+				i += 2
+			} else if (arg == '-u' || arg == '-i') && i + 1 < box_args.len {
+				is_upstream := arg == '-u'
+				chain_parts := box_args[i + 1].split('+')
+				mut current_paths := [][]Node{}; current_paths << []Node{}
+				
+				for p in chain_parts {
+					part := p.trim_space()
+					if part == '' { continue }
+					if part.starts_with('-x') {
+						name := part[2..].trim_space()
+						if name == '' || current_paths[0].len == 0 { exit(1) }
+						if is_snapshot_name(name) {
+							if name !in macros { macros[name] = [][]Node{} }
+							for path in current_paths {
+								if path.len > 0 { macros[name] << path.clone() }
+							}
+						} else {
+							node := parse_uri(name) or { exit(1) }
+							mut new_chain_idxs := []int{}
+							for path in current_paths {
+								if path.len > 0 {
+									chains << Chain{ nodes: path.clone(), alive: true, global: false }
+									new_chain_idxs << (chains.len - 1)
+								}
+							}
+							mut existing_idx := -1
+							for j in 0 .. listeners.len {
+								if listeners[j].addr == node.addr && listeners[j].proto == node.proto { existing_idx = j; break }
+							}
+							if existing_idx >= 0 {
+								for cidx in new_chain_idxs {
+									if cidx !in listeners[existing_idx].chain_idxs { listeners[existing_idx].chain_idxs << cidx }
+								}
+							} else {
+								listeners << Listener{ proto: node.proto, addr: node.addr, user: node.user, pass: node.pass, chain_idxs: new_chain_idxs, is_global: false }
+							}
+						}
+					} else {
+						if is_snapshot_name(part) {
+							if part in macros {
+								mut next_paths := [][]Node{}
+								for path in current_paths {
+									for macro_path in macros[part] {
+										mut new_path := path.clone()
+										for n in macro_path { new_path << n }
+										next_paths << new_path
+									}
+								}
+								current_paths = next_paths.clone()
+							} else { exit(1) }
+						} else {
+							node := parse_uri(part) or { exit(1) }
+							for mut path in current_paths { path << node }
+						}
+					}
+				}
+				if is_upstream {
+					for path in current_paths {
+						if path.len > 0 { chains << Chain{ nodes: path.clone(), alive: true, global: true } }
+					}
+				}
+				i += 2
+			} else if arg == '-o' && i + 1 < box_args.len {
+				global_outbound_str = box_args[i+1]
+				i += 2
+			} else {
+				eprintln('[!] [Box ${box_idx+1}] Unknown argument: ${box_args[i]}'); exit(1)
+			}
+		}
+		
+		if global_outbound_str != '' {
+			mut out_paths := [][]Node{}; out_paths << []Node{}
+			for p in global_outbound_str.split('+') {
+				part := p.trim_space()
+				if part == '' { continue }
+				if is_snapshot_name(part) {
+					if part in macros {
+						mut next_paths := [][]Node{}
+						for path in out_paths {
+							for macro_path in macros[part] {
+								mut np := path.clone()
+								for n in macro_path { np << n }
+								next_paths << np
+							}
+						}
+						out_paths = next_paths.clone()
+					} else { exit(1) }
+				} else {
+					node := parse_uri(part) or { exit(1) }
+					for mut path in out_paths { path << node }
+				}
+			}
+			if out_paths.len > 0 && out_paths[0].len > 0 {
+				single_out := out_paths[0] 
+				for mut c in chains {
+					for n in single_out { c.nodes << n }
+				}
+			}
+		}
+
+		if listeners.len == 0 {
+			eprintln('[!] [Box ${box_idx+1}] Skipped: No listeners defined.')
+			continue
+		}
+		
+		mut app := &App{
+			id: box_idx + 1
+			listeners: listeners
+			chains: chains
+			rr_counter: 0
+			udp_port: u32(40000 + (box_idx * 1000))
+			verbose: verbose
+		}
+		apps << app
+
+		println('[*] [Box ${app.id}] Parsed successfully. ${listeners.len} listener(s), ${chains.len} routing chain(s).')
+		if verbose { println('    -> VERBOSE mode enabled for this Box.') }
+	}
+
+	if apps.len == 0 {
+		eprintln('[!] No valid boxes found to start.')
+		return
+	}
+	
+	println('[*] Starting ${apps.len} independent Box(es)...')
+	
+	for mut app in apps {
+		spawn health_checker(mut app)
+		for li in 0 .. app.listeners.len {
+			spawn start_listener(mut app, li)
+		}
+	}
 	for { time.sleep(1 * time.hour) }
 }
 
@@ -486,9 +536,11 @@ fn do_relay(mut a net.TcpConn, mut b net.TcpConn, script []Rule, verbose bool) {
 @[inline]
 fn start_listener(mut app App, li int) {
 	l := app.listeners[li]
+	pname := match l.proto { .socks5 { 'SOCKS5' } .http { 'HTTP' } .sni { 'SNI' } .dns { 'DNS' } }
+	
 	if l.proto == .dns {
 		mut listener := net.listen_udp(l.addr) or { return }
-		println('[+] DNS on ${l.addr} (UDP)')
+		println('[+] [Box ${app.id}] ${pname} on ${l.addr} (UDP)')
 		for {
 			mut buf := []u8{len: 2048}
 			n, addr := listener.read(mut buf) or { continue }
@@ -497,8 +549,7 @@ fn start_listener(mut app App, li int) {
 		return
 	}
 	mut listener := net.listen_tcp(.ip, l.addr) or { return }
-	pname := match l.proto { .socks5 { 'SOCKS5' } .http { 'HTTP' } .sni { 'SNI' } else { '' } }
-	println('[+] ${pname} on ${l.addr} (TCP)')
+	println('[+] [Box ${app.id}] ${pname} on ${l.addr} (TCP)')
 	for {
 		mut conn := listener.accept() or { continue }
 		spawn handle_conn(mut app, mut conn, li)

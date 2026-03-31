@@ -222,5 +222,37 @@ The application acts as a parent process. **If the main application is closed, c
 
 ---
 
+### 6. Isolated Workspaces / Boxes (`::`)
+
+SocksLender supports running **multiple, completely independent configurations** within a single process. This eliminates the need to open multiple terminal windows or run several instances of the application to handle different routing logic.
+
+**How it works:**
+By using the double-colon `::` delimiter, you can split your arguments into isolated "Boxes". Each Box maintains its own private list of Listeners, Upstreams, Snapshots, Outbounds, and Verbose settings. 
+
+**Key Benefits:**
+*   **Zero Port Collision:** Internal UDP allocation is automatically sandboxed per Box to prevent conflicts.
+*   **Unified Lifecycle:** If you press `Ctrl+C`, all boxes gracefully shut down simultaneously.
+*   **Segmented Logging:** Console outputs are tagged with `[Box 1]`, `[Box 2]`, etc., making debugging effortless.
+
+**Example Usage:**
+
+```bash
+./sockslender \
+  -v -l 127.0.0.1:1080 -u 1.1.1.1:8080?0-4=FFFF? \
+  :: \
+  -l 127.0.0.1:2080 -i 2.2.2.2:443+-xMY_MACRO -u MY_MACRO+3.3.3.3:80 \
+  :: \
+  -r?tor? -l 127.0.0.1:9050 -u socks5://127.0.0.1:9050
+```
+
+**In this example:**
+*   **Box 1:** Listens on port `1080`, routes to `1.1.1.1`, and actively edits traffic (Verbose enabled).
+*   **Box 2:** Listens on `2080`, uses a private macro (`MY_MACRO`), and routes through `3.3.3.3`. (Verbose disabled).
+*   **Box 3:** Spawns `Tor` in the background globally, and creates a listener that funnels traffic into it.
+
+*All running harmoniously in one single background process!*
+
+---
+
 ## License
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
