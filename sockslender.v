@@ -23,8 +23,8 @@ struct Node {
 }
 
 struct Chain {
-	nodes []Node
 	mut:
+	nodes []Node
 	alive   bool
 	latency i64
 	global  bool
@@ -129,11 +129,13 @@ fn main() {
 	mut listeners := []Listener{}
 	mut chains := []Chain{}
 	mut macros := map[string][][]Node{}
-	
+	mut global_outbound_str := ''
 	mut i := 1
 
 	for i < os.args.len {
-		if os.args[i] == '-l' && i + 1 < os.args.len {
+		arg := os.args[i]
+		
+		if arg == '-l' && i + 1 < os.args.len {
 			raw_uri := os.args[i + 1]
 			node := parse_uri(raw_uri) or {
 				eprintln('[!] Listener Error: ${err}')
@@ -160,7 +162,9 @@ fn main() {
 				}
 			}
 			i += 2
-		} else if os.args[i] == '-u' && i + 1 < os.args.len {
+			
+		} else if (arg == '-u' || arg == '-i') && i + 1 < os.args.len {
+			is_upstream := arg == '-u'
 			chain_parts := os.args[i + 1].split('+')
 			mut current_paths := [][]Node{}
 			current_paths << []Node{}
@@ -248,7 +252,7 @@ fn main() {
 							}
 							current_paths = next_paths.clone()
 						} else {
-							eprintln('[!] Upstream Error: Snapshot "${part}" is used before definition or does not exist.')
+							eprintln('[!] Upstream Error: Snapshot "${part}" is used before definition.')
 							exit(1)
 						}
 					} else {
@@ -263,25 +267,79 @@ fn main() {
 				}
 			}
 			
-			for path in current_paths {
-				if path.len > 0 {
-					chains << Chain{
-						nodes: path.clone()
-						alive: true
-						latency: 0
-						global: true
+			if is_upstream {
+				for path in current_paths {
+					if path.len > 0 {
+						chains << Chain{
+							nodes: path.clone()
+							alive: true
+							latency: 0
+							global: true
+						}
 					}
 				}
 			}
+			i += 2
+			
+		} else if arg == '-o' && i + 1 < os.args.len {
+			global_outbound_str = os.args[i+1]
 			i += 2
 		} else {
 			eprintln('[!] Unknown or incomplete argument: ${os.args[i]}')
 			exit(1)
 		}
 	}
+	
+	if global_outbound_str != '' {
+		mut out_paths := [][]Node{}
+		out_paths << []Node{}
+		
+		for p in global_outbound_str.split('+') {
+			part := p.trim_space()
+			if part == '' { continue }
+			if part.starts_with('-x') {
+				eprintln('[!] Error: Cannot use "-x" inside "-o".')
+				exit(1)
+			}
+			
+			if is_snapshot_name(part) {
+				if part in macros {
+					mut next_paths := [][]Node{}
+					for path in out_paths {
+						for macro_path in macros[part] {
+							mut np := path.clone()
+							for n in macro_path { np << n }
+							next_paths << np
+						}
+					}
+					out_paths = next_paths.clone()
+				} else {
+					eprintln('[!] Error: Snapshot "${part}" in "-o" not found.')
+					exit(1)
+				}
+			} else {
+				node := parse_uri(part) or {
+					eprintln('[!] Outbound Node Error: ${err}')
+					exit(1)
+				}
+				for mut path in out_paths {
+					path << node
+				}
+			}
+		}
+		
+		if out_paths.len > 0 && out_paths[0].len > 0 {
+			single_out := out_paths[0] 
+			for mut c in chains {
+				for n in single_out {
+					c.nodes << n
+				}
+			}
+		}
+	}
 
 	if listeners.len == 0 || chains.len == 0 {
-		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr:port -u [proto://][user:pass@]addr:port[+-x addr_or_SNAPSHOT][+chain]')
+		eprintln('Usage: ${os.args[0]} -l [proto://][user:pass@]addr:port -u/-i [proto://][user:pass@]addr:port[+-x SNAPSHOT] [-o OUTBOUND]')
 		return
 	}
 
@@ -298,7 +356,11 @@ fn main() {
 	}
 
 	println('[*] Parsed successfully. Starting...')
-	println('[*] ${listeners.len} listener(s), ${chains.len} active routing chain(s), ${macros.len} internal snapshot(s)')
+	println('[*] ${listeners.len} listener(s), ${chains.len} active routing chain(s), ${macros.len} snapshot(s)')
+	if global_outbound_str != '' {
+		println('[*] Global outbound (-o) active and appended to all chains.')
+	}
+	
 	for {
 		time.sleep(1 * time.hour)
 	}
