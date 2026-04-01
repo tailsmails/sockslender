@@ -9,6 +9,21 @@ const check_interval = 20 * time.second
 const check_timeout = 5 * time.second
 const buf_size = 65536
 
+struct ManagedProcess {
+	cmd          string
+	args         []string
+	endpoint     string
+mut:
+	proc         &os.Process
+	last_restart time.Time
+}
+
+struct Watchdog {
+mut:
+	procs []ManagedProcess
+	mu    sync.Mutex
+}
+
 enum ProxyType {
 	socks5
 	http
@@ -225,19 +240,22 @@ fn parse_uri(raw string) !Node {
 
 fn main() {
 	mut child_procs := []&os.Process{}
+	mut wd := &Watchdog{}
 	defer {
-		if child_procs.len > 0 {
-			println('\n[*] Shutting down... Terminating ${child_procs.len} background task(s).')
-			for mut p in child_procs {
-				if p.is_alive() {
-					p.signal_kill()
-					p.wait()
-					p.close()
-				}
-			}
+		mut total_killed := 0
+		for mut p in child_procs {
+			if p.is_alive() { p.signal_kill(); p.wait(); p.close(); total_killed++ }
+		}
+		wd.mu.@lock()
+		for mut mp in wd.procs {
+			if mp.proc.is_alive() { mp.proc.signal_kill(); mp.proc.wait(); mp.proc.close(); total_killed++ }
+		}
+		wd.mu.unlock()
+		if total_killed > 0 {
+			println('\n[*] Shut down complete. Terminated ${total_killed} background task(s).')
 		}
 	}
-	
+
 	mut raw_args := os.args[1..].clone()
 	mut boxes_args := [][]string{}
 	mut current_box := []string{}
@@ -293,6 +311,40 @@ fn main() {
 						println('[*] [Global] Started background task: ${parts[0]} (PID: ${p.pid})')
 					}
 				}
+				i++
+				continue
+      } else if arg.starts_with('-rr?') && arg.ends_with('?') {
+				raw_cmds := arg[4..arg.len-1]
+				parts := raw_cmds.split(',')
+				
+				if parts.len % 2 != 0 {
+					eprintln('[!] -rr syntax error: must be pairs of (command, endpoint)')
+					exit(1)
+				}
+				
+				wd.mu.@lock()
+				for j := 0; j < parts.len; j += 2 {
+					cmd_clean := parts[j].trim_space()
+					endpoint := parts[j+1].trim_space()
+					if cmd_clean == '' || endpoint == '' { continue }
+					
+					cmd_parts := cmd_clean.split(' ').filter(it != '')
+					if cmd_parts.len > 0 {
+						mut p := os.new_process(cmd_parts[0])
+						if cmd_parts.len > 1 { p.set_args(cmd_parts[1..]) }
+						p.run()
+						
+						wd.procs << ManagedProcess{
+							cmd: cmd_parts[0]
+							args: cmd_parts[1..]
+							endpoint: endpoint
+							proc: p
+							last_restart: time.now()
+						}
+						println('[*] [Watchdog] Auto-restarting task added: "${cmd_parts[0]}" -> monitoring ${endpoint}')
+					}
+				}
+				wd.mu.unlock()
 				i++
 				continue
 			} else if arg == '-l' && i + 1 < box_args.len {
@@ -979,4 +1031,45 @@ fn tcp_udp_monitor(mut client net.TcpConn, mut relay net.UdpConn, mut out net.Ud
 	for { client.read(mut b) or { break } }
 	relay.close() or {}
 	out.close() or {}
+}
+
+fn watchdog_loop(mut wd Watchdog) {
+	for {
+		time.sleep(15 * time.second)
+
+		wd.mu.@lock()
+		for mut mp in wd.procs {
+			if time.now() - mp.last_restart < 30 * time.second {
+				continue
+			}
+
+			mut alive := true
+			
+			if !mp.proc.is_alive() {
+				alive = false
+			} else {
+				alive = check_tcp_h(mp.endpoint)
+			}
+
+			if !alive {
+				println('\n[!] [Watchdog] CRASH DETECTED: "${mp.cmd}" at ${mp.endpoint} is unresponsive.')
+				println('    -> Terminating and Restarting process...')
+				
+				if mp.proc.is_alive() {
+					mp.proc.signal_kill()
+					mp.proc.wait()
+					mp.proc.close()
+				}
+				
+				mut new_p := os.new_process(mp.cmd)
+				new_p.set_args(mp.args)
+				new_p.run()
+				
+				mp.proc = new_p
+				mp.last_restart = time.now()
+				println('    -> [Watchdog] Process restarted successfully (New PID: ${mp.proc.pid}).\n')
+			}
+		}
+		wd.mu.unlock()
+	}
 }

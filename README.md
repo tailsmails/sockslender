@@ -254,5 +254,31 @@ By using the double-colon `::` delimiter, you can split your arguments into isol
 
 ---
 
+### 7. Global Watchdog & Auto-Restarter (`-rr?...?`)
+
+While `-r` is great for spawning static background processes, `-rr` (Restartable Runner) acts as an intelligent **Watchdog**. It spawns your external tools (like Tor, Xray, etc.) and constantly monitors their TCP ports. 
+
+If a tool crashes, freezes, or fails to respond on its assigned port, SocksLender will forcefully kill the zombie process and **automatically restart it**, ensuring 100% zero-downtime operations.
+
+**Syntax:**
+*   Commands are enclosed between `?` and `?`.
+*   You must provide **pairs** separated by commas: `Command, Target_IP:Port`
+*   *Note: After a restart, the Watchdog gives the app a 30-second "Grace Period" to boot up before checking its health again.*
+
+**Example Usage:**
+
+```bash
+# Spawn Tor and monitor port 9050. Spawn a custom proxy and monitor port 8080.
+./sockslender -rr?"tor --SocksPort 9050", 127.0.0.1:9050, "./myproxyapp -p 8080", 127.0.0.1:8080? -l 127.0.0.1:1080 -u 127.0.0.1:9050
+```
+
+**How it works under the hood:**
+1. Spawns `tor` and `myproxyapp`.
+2. Every 15 seconds, a dedicated thread attempts a TCP handshake with `127.0.0.1:9050` and `127.0.0.1:8080`.
+3. If `tor` freezes due to network issues and port `9050` stops responding, the Watchdog prints `[!] CRASH DETECTED`, kills the frozen PID, and re-runs the Tor command automatically.
+4. When SocksLender is closed, all processes are safely terminated.
+
+---
+
 ## License
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
