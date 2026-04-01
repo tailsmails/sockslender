@@ -9,6 +9,57 @@ const check_interval = 20 * time.second
 const check_timeout = 5 * time.second
 const buf_size = 65536
 
+#include <sys/resource.h>
+
+struct C.rlimit {
+mut:
+	rlim_cur u64
+	rlim_max u64
+}
+
+fn C.getrlimit(int, &C.rlimit) int
+fn C.setrlimit(int, &C.rlimit) int
+fn check_fd_limits() {
+	mut rl := C.rlimit{}
+	if C.getrlimit(7, &rl) != 0 { // 7 = RLIMIT_NOFILE
+		eprintln('[!] Cannot read FD limits')
+		return
+	}
+
+	soft := rl.rlim_cur
+	hard := rl.rlim_max
+	println('[*] FD limits: soft=${soft}, hard=${hard}')
+	
+	if soft < 4096 && soft < hard {
+		rl.rlim_cur = if hard > 65536 { u64(65536) } else { hard }
+		if C.setrlimit(7, &rl) == 0 {
+			println('[*] FD soft limit raised: ${soft} -> ${rl.rlim_cur}')
+		} else {
+			rl.rlim_cur = if hard > 4096 { u64(4096) } else { hard }
+			if C.setrlimit(7, &rl) == 0 {
+				println('[*] FD soft limit raised: ${soft} -> ${rl.rlim_cur}')
+			} else {
+				eprintln('[!] WARNING: Cannot raise FD limit (stuck at ${soft})')
+				eprintln('    Ask admin: ulimit -n 65536')
+			}
+		}
+	}
+	
+	C.getrlimit(7, &rl)
+	final_limit := rl.rlim_cur
+
+	if final_limit < 1024 {
+		eprintln('[!] CRITICAL: FD limit is only ${final_limit}')
+		eprintln('    Application WILL fail under load.')
+		eprintln('    Minimum required: 1024, recommended: 4096+')
+	} else if final_limit <= 4096 {
+		eprintln('[!] WARNING: FD limit is ${final_limit}')
+		eprintln('    Heavy concurrent DNS+TCP traffic may exhaust file descriptors.')
+	} else {
+		println('[*] FD limit OK: ${final_limit}')
+	}
+}
+
 struct ManagedProcess {
 	cmd          string
 	args         []string
@@ -239,6 +290,7 @@ fn parse_uri(raw string) !Node {
 }
 
 fn main() {
+	check_fd_limits()
 	mut child_procs := []&os.Process{}
 	mut wd := &Watchdog{}
 	defer {
