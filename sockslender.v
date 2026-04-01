@@ -12,7 +12,7 @@ const buf_size = 65536
 struct ManagedProcess {
 	cmd          string
 	args         []string
-	endpoint     string
+	check_node   Node
 mut:
 	proc         &os.Process
 	last_restart time.Time
@@ -328,6 +328,13 @@ fn main() {
 					endpoint := parts[j+1].trim_space()
 					if cmd_clean == '' || endpoint == '' { continue }
 					
+					mut check_node := parse_uri(endpoint) or {
+						parse_uri('sni://' + endpoint) or { 
+							eprintln('[!] [Watchdog] Invalid endpoint format: ${endpoint}')
+							continue 
+						}
+					}
+					
 					cmd_parts := cmd_clean.split(' ').filter(it != '')
 					if cmd_parts.len > 0 {
 						mut p := os.new_process(cmd_parts[0])
@@ -337,11 +344,13 @@ fn main() {
 						wd.procs << ManagedProcess{
 							cmd: cmd_parts[0]
 							args: cmd_parts[1..]
-							endpoint: endpoint
+							check_node: check_node
 							proc: p
 							last_restart: time.now()
 						}
-						println('[*] [Watchdog] Auto-restarting task added: "${cmd_parts[0]}" -> monitoring ${endpoint}')
+						
+						pname := match check_node.proto { .socks5 {'SOCKS5'} .http {'HTTP'} else {'TCP'} }
+						println('[*] [Watchdog] Auto-restarting task added: "${cmd_parts[0]}" -> monitoring ${check_node.addr} via ${pname} handshake')
 					}
 				}
 				wd.mu.unlock()
@@ -621,33 +630,41 @@ fn handle_conn(mut app App, mut client net.TcpConn, li int) {
 
 fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Addr, req []u8, l Listener) {
 	mut order := if l.is_global { pick_chain_order(mut app) } else { pick_best_from_list(mut app, l.chain_idxs) }
+	
 	if order.len == 0 { return }
-	mut ans_ch := chan []u8{cap: 3}
-	mut sent := 0
-
+	
 	for ci in order {
-		if sent >= 3 { break } 
 		app.mu.@lock()
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
+		
 		if nodes.len == 0 || nodes[0].proto != .dns { continue }
+		
 		up_addrs := net.resolve_addrs(nodes[0].addr, .ip, .udp) or { continue }
 		if up_addrs.len == 0 { continue }
-		sent++
 		
-		spawn fn (addr net.Addr, req []u8, ans_ch chan []u8) {
-			mut out_conn := net.listen_udp('0.0.0.0:0') or { return }
-			out_conn.set_read_timeout(2 * time.second)
-			out_conn.write_to(addr, req) or { out_conn.close() or {}; return }
-			mut resp_buf := []u8{len: 2048}
-			rn, _ := out_conn.read(mut resp_buf) or { out_conn.close() or {}; return }
-			if rn > 0 { ans_ch <- resp_buf[..rn].clone() }
+		mut out_conn := net.listen_udp('0.0.0.0:0') or { continue }
+		out_conn.set_read_timeout(500 * time.millisecond)
+		
+		out_conn.write_to(up_addrs[0], req) or { 
 			out_conn.close() or {}
-		}(up_addrs[0], req, ans_ch)
+			continue 
+		}
+		
+		mut resp_buf := []u8{len: 2048}
+		rn, _ := out_conn.read(mut resp_buf) or { 
+			out_conn.close() or {}
+			continue 
+		}
+		
+		if rn > 0 {
+			listener.write_to(client_addr, resp_buf[..rn]) or {}
+			out_conn.close() or {}
+			return 
+		}
+		
+		out_conn.close() or {}
 	}
-
-	if sent == 0 { return }
-	select { fastest_response := <-ans_ch { listener.write_to(client_addr, fastest_response) or {} } 2 * time.second {} }
 }
 
 fn health_checker(mut app App) {
@@ -1048,11 +1065,13 @@ fn watchdog_loop(mut wd Watchdog) {
 			if !mp.proc.is_alive() {
 				alive = false
 			} else {
-				alive = check_tcp_h(mp.endpoint)
+				temp_chain := Chain{nodes: [mp.check_node], alive: true}
+				alive = check_chain(temp_chain)
 			}
 
 			if !alive {
-				println('\n[!] [Watchdog] CRASH DETECTED: "${mp.cmd}" at ${mp.endpoint} is unresponsive.')
+				pname := match mp.check_node.proto { .socks5 {'SOCKS5'} .http {'HTTP'} else {'TCP'} }
+				println('\n[!] [Watchdog] CRASH/FREEZE DETECTED: "${mp.cmd}" failed ${pname} handshake at ${mp.check_node.addr}.')
 				println('    -> Terminating and Restarting process...')
 				
 				if mp.proc.is_alive() {
