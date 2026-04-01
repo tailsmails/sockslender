@@ -9,6 +9,7 @@ const check_interval = 20 * time.second
 const check_timeout = 5 * time.second
 const buf_size = 65536
 
+$if !windows {
 #include <sys/resource.h>
 
 struct C.rlimit {
@@ -59,7 +60,7 @@ fn check_fd_limits() {
 		println('[*] FD limit OK: ${final_limit}')
 	}
 }
-
+}
 struct ManagedProcess {
 	cmd          string
 	args         []string
@@ -290,7 +291,9 @@ fn parse_uri(raw string) !Node {
 }
 
 fn main() {
+	$if !windows {
 	check_fd_limits()
+	}
 	mut child_procs := []&os.Process{}
 	mut wd := &Watchdog{}
 	defer {
