@@ -996,6 +996,9 @@ fn do_relay(mut a net.TcpConn, mut b net.TcpConn, script []Rule, verbose bool) {
 	spawn relay(mut a, mut b, done, script, verbose)
 	spawn relay(mut b, mut a, done, []Rule{}, false)
 	_ = <-done
+	a.close() or {}
+	b.close() or {}
+	_ = <-done
 }
 
 @[inline]
@@ -1007,15 +1010,22 @@ fn start_listener(mut app App, li int) {
 		.sni { 'SNI' }
 		.dns { 'DNS' }
 	}
-
 	if l.proto == .dns {
 		mut listener := net.listen_udp(l.addr) or { return }
 		println('[+] [Box ${app.id}] ${pname} on ${l.addr} (UDP)')
+
+		sem := chan bool{cap: 50}
+
 		for {
 			mut buf := []u8{len: 2048}
 			n, addr := listener.read(mut buf) or { continue }
 			if n > 0 {
-				spawn handle_dns_request(mut app, mut listener, addr, buf[..n].clone(), l)
+				select {
+					sem <- true {
+						spawn handle_dns_with_sem(mut app, mut listener, addr, buf[..n].clone(), l, sem)
+					}
+					else {}
+				}
 			}
 		}
 		return
@@ -1334,8 +1344,18 @@ fn connect_chain(chain []Node, host string, port int) !&net.TcpConn {
 	}
 	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial failed') }
 	match chain[0].proto {
-		.socks5 { do_socks5_hs(mut conn, chain[0], host, port)! }
-		.http { do_http_hs(mut conn, chain[0], host, port)! }
+		.socks5 {
+			do_socks5_hs(mut conn, chain[0], host, port) or {
+				conn.close() or {}
+				return err
+			}
+		}
+		.http {
+			do_http_hs(mut conn, chain[0], host, port) or {
+				conn.close() or {}
+				return err
+			}
+		}
 		.sni {}
 		.dns {}
 	}
@@ -1524,9 +1544,9 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 		client.write([u8(0x05), 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) or {}
 		return
 	}
-	defer {
-		upstream.close() or {}
-	}
+	//defer {
+		//upstream.close() or {}
+	//}
 	mut ok := []u8{len: 10}
 	ok[0] = 0x05
 	ok[3] = 0x01
@@ -1706,6 +1726,9 @@ fn extract_sni(d []u8) string {
 
 @[inline]
 fn read_full(mut c net.TcpConn, mut buf []u8, min int) !int {
+	if min > buf.len {
+		return error('min exceeds buffer')
+	}
 	mut total := 0
 	for total < min {
 		n := c.read(mut buf[total..]) or { return err }
@@ -1930,4 +1953,9 @@ fn watchdog_loop(mut wd Watchdog) {
 			wd.mu.unlock()
 		}
 	}
+}
+
+fn handle_dns_with_sem(mut app App, mut listener net.UdpConn, client_addr net.Addr, req []u8, l Listener, sem chan bool) {
+	defer { _ := <-sem }
+	handle_dns_request(mut app, mut listener, client_addr, req, l)
 }
