@@ -26,6 +26,7 @@ struct ManagedProcess {
 	cmd        string
 	args       []string
 	check_node Node
+	conf_path  string
 mut:
 	proc          &os.Process
 	last_restart  time.Time
@@ -52,19 +53,19 @@ struct PatternByte {
 
 struct Rule {
 mut:
-	mode        string
-	aob_pattern []PatternByte
-	has_cond    bool
-	cond_start  int
-	cond_end    int
-	cond_hex    []u8
+	mode         string
+	aob_pattern  []PatternByte
+	has_cond     bool
+	cond_start   int
+	cond_end     int
+	cond_hex     []u8
 	action_start int
 	action_end   int
 	action_hex   []u8
-	has_else    bool
-	else_start  int
-	else_end    int
-	else_hex    []u8
+	has_else     bool
+	else_start   int
+	else_end     int
+	else_hex     []u8
 }
 
 struct Node {
@@ -186,6 +187,78 @@ fn record_failure(mut c Chain) {
 		c.succ = c.succ * 3 / 4
 		c.fail = c.fail * 3 / 4
 	}
+}
+
+fn find_proxychains_bin() string {
+	for name in ['proxychains4', 'proxychains'] {
+		result := os.execute('which ${name}')
+		result_two := os.execute('/system/bin/which ${name}')
+		if result.exit_code == 0 {
+			found := result.output.trim_space()
+			if found.len > 0 {
+				return found
+			}
+		} else { if result_two.exit_code == 0 { found_two := result_two.output.trim_space(); if found_two.len > 0 { return found_two } }}
+	}
+	return ''
+}
+
+fn find_prior_nodes(chains []Chain, endpoint_addr string) []Node {
+	for c in chains {
+		for i, n in c.nodes {
+			if n.addr == endpoint_addr && i > 0 {
+				return c.nodes[..i].clone()
+			}
+		}
+	}
+	return []Node{}
+}
+
+fn gen_proxychains_conf(nodes []Node, box_id int, idx int) string {
+	path := 'sockslender_pc_${box_id}_${idx}.conf'
+	mut lines := []string{}
+	lines << 'strict_chain'
+	lines << 'quiet_mode'
+	lines << 'proxy_dns'
+	lines << 'tcp_read_time_out 15000'
+	lines << 'tcp_connect_time_out 8000'
+	lines << ''
+	lines << '[ProxyList]'
+	for n in nodes {
+		host, port := parse_host_port(n.addr)
+		if host == '' || port == '' {
+			continue
+		}
+		ptype := match n.proto {
+			.socks5 { 'socks5' }
+			.http { 'http' }
+			else { '' }
+		}
+		if ptype == '' {
+			continue
+		}
+		if n.user != '' {
+			lines << '${ptype}\t${host}\t${port}\t${n.user}\t${n.pass}'
+		} else {
+			lines << '${ptype}\t${host}\t${port}'
+		}
+	}
+	os.write_file(path, lines.join('\n') + '\n') or { return '' }
+	return path
+}
+
+fn parse_host_port(addr string) (string, string) {
+	if addr.starts_with('[') {
+		close_bracket := addr.index(']') or { return '', '' }
+		host := addr[1..close_bracket]
+		if close_bracket + 1 < addr.len && addr[close_bracket + 1] == `:` {
+			port := addr[close_bracket + 2..]
+			return host, port
+		}
+		return host, ''
+	}
+	last_colon := addr.last_index(':') or { return addr, '' }
+	return addr[..last_colon], addr[last_colon + 1..]
 }
 
 fn is_snapshot_name(s string) bool {
@@ -386,6 +459,9 @@ fn main() {
 				mp.proc.close()
 				total_killed++
 			}
+			if mp.conf_path != '' {
+				os.rm(mp.conf_path) or {}
+			}
 		}
 		wd.mu.unlock()
 		if total_killed > 0 {
@@ -422,6 +498,7 @@ fn main() {
 		mut macros := map[string][][]Node{}
 		mut global_outbound_str := ''
 		mut verbose := false
+		mut rrr_entries := [][]string{}
 		mut i := 0
 
 		for i < box_args.len {
@@ -450,6 +527,22 @@ fn main() {
 						println('[*] [Global] Started background task: ${parts[0]} (PID: ${p.pid})')
 					}
 				}
+				i++
+				continue
+			} else if arg.starts_with('-rrr?') && arg.ends_with('?') {
+				raw_content := arg[5..arg.len - 1]
+				comma_pos := raw_content.last_index(',') or { -1 }
+				if comma_pos <= 0 {
+					eprintln('[!] -rrr syntax: -rrr?command,endpoint_addr:port?')
+					exit(1)
+				}
+				rrr_cmd := raw_content[..comma_pos].trim_space()
+				rrr_ep := raw_content[comma_pos + 1..].trim_space()
+				if rrr_cmd == '' || rrr_ep == '' {
+					eprintln('[!] -rrr: empty command or endpoint')
+					exit(1)
+				}
+				rrr_entries << [rrr_cmd, rrr_ep]
 				i++
 				continue
 			} else if arg.starts_with('-rr?') && arg.ends_with('?') {
@@ -483,6 +576,7 @@ fn main() {
 							cmd: cmd_parts[0]
 							args: cmd_parts[1..]
 							check_node: check_node
+							conf_path: ''
 							proc: p
 							last_restart: time.now()
 						}
@@ -671,6 +765,98 @@ fn main() {
 				}
 			}
 		}
+		if rrr_entries.len > 0 {
+			pc_bin := find_proxychains_bin()
+			if pc_bin == '' {
+				eprintln('[!] proxychains4 not found! Install: apt install proxychains4')
+				eprintln('    -rrr entries will be skipped.')
+			} else {
+				for rrr_idx, entry in rrr_entries {
+					rrr_cmd_str := entry[0]
+					rrr_endpoint := entry[1]
+
+					mut ep_addr := rrr_endpoint
+					if !ep_addr.contains(':') {
+						eprintln('[!] [Box ${box_idx + 1}] -rrr: invalid endpoint (missing port): ${rrr_endpoint}')
+						continue
+					}
+
+					mut prior := find_prior_nodes(chains, ep_addr)
+					if prior.len == 0 {
+						for proto_prefix in ['socks5://', 'http://'] {
+							ep_node := parse_uri(proto_prefix + rrr_endpoint) or { continue }
+							prior = find_prior_nodes(chains, ep_node.addr)
+							if prior.len > 0 {
+								break
+							}
+						}
+					}
+					if prior.len == 0 {
+						eprintln('[!] [Box ${box_idx + 1}] -rrr: "${ep_addr}" not found in any chain, or is the first node')
+						eprintln('    Available chain nodes:')
+						for ci, c in chains {
+							mut addrs := []string{}
+							for n in c.nodes {
+								addrs << n.addr
+							}
+							eprintln('      Chain ${ci}: ${addrs.join(' -> ')}')
+						}
+						continue
+					}
+
+					conf_path := gen_proxychains_conf(prior, box_idx + 1, rrr_idx)
+					if conf_path == '' {
+						eprintln('[!] -rrr: failed to write proxychains config')
+						continue
+					}
+
+					cmd_parts := rrr_cmd_str.split(' ').filter(it != '')
+					if cmd_parts.len == 0 {
+						continue
+					}
+
+					mut pc_args := ['-q', '-f', conf_path]
+					for cp in cmd_parts {
+						pc_args << cp
+					}
+
+					mut p := os.new_process(pc_bin)
+					p.set_args(pc_args)
+					p.run()
+
+					check_node := parse_uri(rrr_endpoint) or {
+						parse_uri('socks5://' + rrr_endpoint) or {
+							eprintln('[!] -rrr: cannot parse endpoint for monitoring')
+							continue
+						}
+					}
+
+					wd.mu.@lock()
+					wd.procs << ManagedProcess{
+						cmd: pc_bin
+						args: pc_args.clone()
+						check_node: check_node
+						conf_path: conf_path
+						proc: p
+						last_restart: time.now()
+					}
+					wd.mu.unlock()
+
+					mut chain_desc := []string{}
+					for n in prior {
+						pt := match n.proto {
+							.socks5 { 'socks5' }
+							.http { 'http' }
+							else { 'tcp' }
+						}
+						chain_desc << '${pt}://${n.addr}'
+					}
+					println('[*] [Box ${box_idx + 1}] -rrr: "${rrr_cmd_str}" tunneled via:')
+					println('    ${chain_desc.join(' -> ')} -> ${ep_addr}')
+					println('    PID: ${p.pid} | proxychains: ${pc_bin} | config: ${conf_path}')
+				}
+			}
+		}
 
 		if listeners.len == 0 {
 			eprintln('[!] [Box ${box_idx + 1}] Skipped: No listeners defined.')
@@ -699,6 +885,8 @@ fn main() {
 	}
 
 	println('[*] Starting ${apps.len} independent Box(es)...')
+
+	spawn watchdog_loop(mut wd)
 
 	for mut app in apps {
 		spawn health_checker(mut app)
@@ -1646,8 +1834,9 @@ fn watchdog_loop(mut wd Watchdog) {
 			last_restart := wd.procs[idx].last_restart
 			rc := wd.procs[idx].restart_count
 			proc_alive := wd.procs[idx].proc.is_alive()
+			conf_path := wd.procs[idx].conf_path
 			wd.mu.unlock()
-			
+
 			mut cooldown_secs := i64(30)
 			for _ in 0 .. rc {
 				cooldown_secs *= 2
@@ -1659,7 +1848,7 @@ fn watchdog_loop(mut wd Watchdog) {
 			if time.now() - last_restart < cooldown_secs * time.second {
 				continue
 			}
-			
+
 			mut alive := true
 			if !proc_alive {
 				alive = false
@@ -1670,7 +1859,7 @@ fn watchdog_loop(mut wd Watchdog) {
 				}
 				alive = check_chain(temp_chain)
 			}
-			
+
 			if alive {
 				if rc > 0 {
 					wd.mu.@lock()
@@ -1681,7 +1870,7 @@ fn watchdog_loop(mut wd Watchdog) {
 				}
 				continue
 			}
-			
+
 			wd.mu.@lock()
 			if idx >= wd.procs.len {
 				wd.mu.unlock()
@@ -1701,23 +1890,24 @@ fn watchdog_loop(mut wd Watchdog) {
 			} else {
 				println('\n[!] [Watchdog] CRASH DETECTED: "${cmd}" is dead (restart #${new_rc})')
 			}
-			
+
 			if wd.procs[idx].proc.is_alive() {
 				wd.procs[idx].proc.signal_kill()
 			}
 			wd.procs[idx].proc.wait()
 			wd.procs[idx].proc.close()
-			
+
 			mut new_p := os.new_process(cmd)
-			if args.len > 0 {
-				new_p.set_args(args)
+			new_args := args.clone()
+			if new_args.len > 0 {
+				new_p.set_args(new_args)
 			}
 			new_p.run()
 
 			wd.procs[idx].proc = new_p
 			wd.procs[idx].last_restart = time.now()
 			wd.procs[idx].restart_count = new_rc
-			
+
 			mut next_cd := i64(30)
 			for _ in 0 .. new_rc {
 				next_cd *= 2
@@ -1727,13 +1917,14 @@ fn watchdog_loop(mut wd Watchdog) {
 				}
 			}
 
-			println('    -> Restarted (PID: ${new_p.pid}). Next check in ${next_cd}s.')
+			if conf_path != '' {
+				println('    -> Restarted via proxychains (PID: ${new_p.pid}). Next check in ${next_cd}s.')
+			} else {
+				println('    -> Restarted (PID: ${new_p.pid}). Next check in ${next_cd}s.')
+			}
 
 			if new_rc >= 5 {
-				println('    [!] WARNING: "${cmd}" restarted ${new_rc} times! Check config.')
-			}
-			if new_rc >= 15 {
-				println('    [!!] CRITICAL: "${cmd}" restarted ${new_rc} times! Giving up monitoring.')
+				println('    [!] WARNING: "${cmd}" restarted ${new_rc} times!')
 			}
 
 			wd.mu.unlock()
