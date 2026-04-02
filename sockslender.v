@@ -27,8 +27,9 @@ struct ManagedProcess {
 	args       []string
 	check_node Node
 mut:
-	proc         &os.Process
-	last_restart time.Time
+	proc          &os.Process
+	last_restart  time.Time
+	restart_count u32
 }
 
 struct Watchdog {
@@ -1628,42 +1629,114 @@ fn tcp_udp_monitor(mut client net.TcpConn, mut relay_conn net.UdpConn, mut out n
 fn watchdog_loop(mut wd Watchdog) {
 	for {
 		time.sleep(15 * time.second)
+
 		wd.mu.@lock()
-		for mut mp in wd.procs {
-			if time.now() - mp.last_restart < 30 * time.second {
+		count := wd.procs.len
+		wd.mu.unlock()
+
+		for idx in 0 .. count {
+			wd.mu.@lock()
+			if idx >= wd.procs.len {
+				wd.mu.unlock()
+				break
+			}
+			cmd := wd.procs[idx].cmd
+			args := wd.procs[idx].args.clone()
+			check_node := wd.procs[idx].check_node
+			last_restart := wd.procs[idx].last_restart
+			rc := wd.procs[idx].restart_count
+			proc_alive := wd.procs[idx].proc.is_alive()
+			wd.mu.unlock()
+			
+			mut cooldown_secs := i64(30)
+			for _ in 0 .. rc {
+				cooldown_secs *= 2
+				if cooldown_secs > 300 {
+					cooldown_secs = 300
+					break
+				}
+			}
+			if time.now() - last_restart < cooldown_secs * time.second {
 				continue
 			}
+			
 			mut alive := true
-			if !mp.proc.is_alive() {
+			if !proc_alive {
 				alive = false
 			} else {
 				temp_chain := Chain{
-					nodes: [mp.check_node]
+					nodes: [check_node]
 					alive: true
 				}
 				alive = check_chain(temp_chain)
 			}
-			if !alive {
-				pname := match mp.check_node.proto {
-					.socks5 { 'SOCKS5' }
-					.http { 'HTTP' }
-					else { 'TCP' }
+			
+			if alive {
+				if rc > 0 {
+					wd.mu.@lock()
+					if idx < wd.procs.len {
+						wd.procs[idx].restart_count = 0
+					}
+					wd.mu.unlock()
 				}
-				println('\n[!] [Watchdog] CRASH/FREEZE DETECTED: "${mp.cmd}" failed ${pname} handshake at ${mp.check_node.addr}.')
-				println('    -> Terminating and Restarting process...')
-				if mp.proc.is_alive() {
-					mp.proc.signal_kill()
-					mp.proc.wait()
-					mp.proc.close()
-				}
-				mut new_p := os.new_process(mp.cmd)
-				new_p.set_args(mp.args)
-				new_p.run()
-				mp.proc = new_p
-				mp.last_restart = time.now()
-				println('    -> [Watchdog] Process restarted successfully (New PID: ${mp.proc.pid}).\n')
+				continue
 			}
+			
+			wd.mu.@lock()
+			if idx >= wd.procs.len {
+				wd.mu.unlock()
+				break
+			}
+
+			new_rc := wd.procs[idx].restart_count + 1
+			pname := match check_node.proto {
+				.socks5 { 'SOCKS5' }
+				.http { 'HTTP' }
+				.dns { 'DNS' }
+				.sni { 'TCP' }
+			}
+
+			if proc_alive {
+				println('\n[!] [Watchdog] FREEZE DETECTED: "${cmd}" alive but ${pname} handshake failed at ${check_node.addr} (restart #${new_rc})')
+			} else {
+				println('\n[!] [Watchdog] CRASH DETECTED: "${cmd}" is dead (restart #${new_rc})')
+			}
+			
+			if wd.procs[idx].proc.is_alive() {
+				wd.procs[idx].proc.signal_kill()
+			}
+			wd.procs[idx].proc.wait()
+			wd.procs[idx].proc.close()
+			
+			mut new_p := os.new_process(cmd)
+			if args.len > 0 {
+				new_p.set_args(args)
+			}
+			new_p.run()
+
+			wd.procs[idx].proc = new_p
+			wd.procs[idx].last_restart = time.now()
+			wd.procs[idx].restart_count = new_rc
+			
+			mut next_cd := i64(30)
+			for _ in 0 .. new_rc {
+				next_cd *= 2
+				if next_cd > 300 {
+					next_cd = 300
+					break
+				}
+			}
+
+			println('    -> Restarted (PID: ${new_p.pid}). Next check in ${next_cd}s.')
+
+			if new_rc >= 5 {
+				println('    [!] WARNING: "${cmd}" restarted ${new_rc} times! Check config.')
+			}
+			if new_rc >= 15 {
+				println('    [!!] CRITICAL: "${cmd}" restarted ${new_rc} times! Giving up monitoring.')
+			}
+
+			wd.mu.unlock()
 		}
-		wd.mu.unlock()
 	}
 }
