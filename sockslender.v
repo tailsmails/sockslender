@@ -319,30 +319,33 @@ fn parse_script(raw string) ![]Rule {
 	if raw.trim_space() == '' {
 		return rules
 	}
-	parts := raw.split(',')
+
+	parts := smart_split_comma(raw)
+
 	for p in parts {
-		if p.trim_space() == '' {
+		mut s := p.trim_space()
+		if s == '' {
 			continue
 		}
 		mut rule := Rule{}
-		mut s := p.trim_space()
+		lower_s := s.to_lower()
 
-		if s.starts_with('L3:') || s.starts_with('l3:') {
-			kv := s[3..]
-			eq_idx := kv.index('=') or { return error('L3: missing = in "${s}"') }
-			rule.mode = 'l3'
-			rule.l3_key = kv[..eq_idx].to_lower()
-			rule.l3_val = kv[eq_idx + 1..]
+		if lower_s.starts_with('l3r:') {
+			kv := s[4..].trim_space()
+			eq_idx := kv.index('=') or { return error('L3R: missing = in "${s}"') }
+			rule.mode = 'l3r'
+			rule.l3_key = kv[..eq_idx].trim_space().to_lower()
+			rule.l3_val = kv[eq_idx + 1..].trim_space()
 			rules << rule
 			continue
 		}
 
-		if s.starts_with('L3R:') || s.starts_with('l3r:') {
-			kv := s[4..]
-			eq_idx := kv.index('=') or { return error('L3R: missing = in "${s}"') }
-			rule.mode = 'l3r'
-			rule.l3_key = kv[..eq_idx].to_lower()
-			rule.l3_val = kv[eq_idx + 1..]
+		if lower_s.starts_with('l3:') {
+			kv := s[3..].trim_space()
+			eq_idx := kv.index('=') or { return error('L3: missing = in "${s}"') }
+			rule.mode = 'l3'
+			rule.l3_key = kv[..eq_idx].trim_space().to_lower()
+			rule.l3_val = kv[eq_idx + 1..].trim_space()
 			rules << rule
 			continue
 		}
@@ -393,6 +396,67 @@ fn parse_script(raw string) ![]Rule {
 		rules << rule
 	}
 	return rules
+}
+
+fn is_rule_start(s string) bool {
+	if s.len == 0 {
+		return false
+	}
+	if s[0] >= `0` && s[0] <= `9` {
+		return true
+	}
+	for c in s {
+		if c == `=` {
+			return true
+		}
+		if c == `,` {
+			break
+		}
+	}
+	return false
+}
+
+fn smart_split_comma(raw string) []string {
+	mut result := []string{}
+	mut current := []u8{}
+	mut in_l3 := false
+	bytes := raw.bytes()
+
+	for idx := 0; idx < bytes.len; idx++ {
+		ch := bytes[idx]
+
+		if ch == u8(`,`) {
+			if in_l3 {
+				peek := raw[idx + 1..].trim_space().to_lower()
+				if peek.starts_with('l3:') || peek.starts_with('l3r:')
+					|| peek.len == 0 || is_rule_start(peek) {
+					result << current.bytestr()
+					current.clear()
+					in_l3 = false
+					continue
+				}
+				current << ch
+				continue
+			}
+			result << current.bytestr()
+			current.clear()
+			continue
+		}
+
+		current << ch
+
+		if !in_l3 && current.len >= 3 {
+			prefix := current.bytestr().trim_space().to_lower()
+			if prefix == 'l3:' || prefix == 'l3r:' {
+				in_l3 = true
+			}
+		}
+	}
+
+	if current.len > 0 {
+		result << current.bytestr()
+	}
+	return result
 }
 
 fn parse_uri(raw string) !Node {
@@ -695,6 +759,7 @@ fn has_l3r_rules(script []Rule) bool {
 
 fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bool {
 	fd := conn.sock.handle
+
 	for rule in script {
 		if rule.mode != 'l3r' {
 			continue
@@ -709,7 +774,8 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					for i in 0 .. fake_payload.len {
 						fake_payload[i] = u8(0x41 + (i % 26))
 					}
-					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18,
+						u8(ttl), fake_payload)
 					if send_raw_packet(dst_ip, dst_port, pkt) && verbose {
 						println('  [L3R] FAKE sent: TTL=${ttl}, ${fake_payload.len} bytes')
 					}
@@ -721,13 +787,37 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq := get_tcp_seq(fd)
-					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x04, u8(ttl), []u8{})
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x04,
+						u8(ttl), []u8{})
 					if send_raw_packet(dst_ip, dst_port, pkt) && verbose {
 						println('  [L3R] FAKE RST sent: TTL=${ttl}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
 			}
+			'oob' {
+				$if !windows {
+					oob_data := hex.decode(rule.l3_val) or { continue }
+					if oob_data.len > 0 {
+						unsafe {
+							C.send(fd, voidptr(oob_data.data), oob_data.len, 1)
+						}
+						if verbose {
+							println('  [L3R] OOB sent: ${rule.l3_val}')
+						}
+						time.sleep(1 * time.millisecond)
+					}
+				}
+			}
+			else {}
+		}
+	}
+
+	for rule in script {
+		if rule.mode != 'l3r' {
+			continue
+		}
+		match rule.l3_key {
 			'split' {
 				pos := parse_int_or_hex(rule.l3_val)
 				if pos > 0 && pos < data.len {
@@ -746,7 +836,8 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					if pos > 0 && pos < data.len {
 						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 						seq := get_tcp_seq(fd)
-						pkt2 := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + u32(pos), 0, 0x18, 64, data[pos..])
+						pkt2 := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + u32(pos),
+							0, 0x18, 64, data[pos..])
 						send_raw_packet(dst_ip, dst_port, pkt2)
 						time.sleep(1 * time.millisecond)
 						conn.write(data[..pos]) or { return false }
@@ -755,20 +846,6 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 							println('  [L3R] DISORDER at ${pos}')
 						}
 						return true
-					}
-				}
-			}
-			'oob' {
-				$if !windows {
-					oob_data := hex.decode(rule.l3_val) or { continue }
-					if oob_data.len > 0 {
-						unsafe {
-							C.send(fd, voidptr(oob_data.data), oob_data.len, 1)
-						}
-						if verbose {
-							println('  [L3R] OOB sent: ${rule.l3_val}')
-						}
-						time.sleep(1 * time.millisecond)
 					}
 				}
 			}
@@ -793,13 +870,10 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					return true
 				}
 			}
-			else {
-				if verbose {
-					println('  [L3R] Unknown: ${rule.l3_key}')
-				}
-			}
+			else {}
 		}
 	}
+
 	conn.write(data) or { return false }
 	return true
 }
@@ -1676,7 +1750,7 @@ fn connect_retry(mut app App, host string, port int, l Listener) !(&net.TcpConn,
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
 		t0 := time.now()
-		conn := connect_chain(nodes, host, port) or {
+		conn := connect_chain(nodes, host, port, app.verbose) or {
 			app.mu.@lock()
 			record_failure(mut app.chains[ci])
 			app.mu.unlock()
@@ -1691,13 +1765,13 @@ fn connect_retry(mut app App, host string, port int, l Listener) !(&net.TcpConn,
 	return error('all chains failed')
 }
 
-fn connect_chain(chain []Node, host string, port int) !&net.TcpConn {
+fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpConn {
 	if chain.len == 0 {
 		return error('empty chain')
 	}
 	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial failed') }
 	if chain[0].script.len > 0 {
-		apply_l3(conn.sock.handle, chain[0].script, false)
+		apply_l3(conn.sock.handle, chain[0].script, verbose)
 	}
 	match chain[0].proto {
 		.socks5 {
@@ -2075,7 +2149,7 @@ fn handle_sni(mut app App, mut client net.TcpConn, l Listener) {
 	} else {
 		upstream.write(payload) or { return }
 	}
-	do_relay(mut client, mut upstream, script, app.verbose)
+	do_relay(mut client, mut upstream, []Rule{}, app.verbose)
 }
 
 @[inline]
