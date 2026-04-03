@@ -702,8 +702,6 @@ Each Box has independent listeners, chains, health checking, and scoring.
 
 ---
 
-### Script Engine Layer Stack
-
 ```
 Processing order per connection:
 ─────────────────────────────────────
@@ -718,6 +716,226 @@ Processing order per connection:
 7. L7: byte patch, AOB scan    (every packet)
 8. Relay
 ```
+
+## Another L3R Rules — Advanced DPI Evasion & Raw Packet Manipulation
+
+### Overview
+
+These L3R rules extend the existing DPI bypass capabilities with IP-level tricks including spoofing, fragmentation, and advanced fake packet techniques. All L3R rules require **root** or `CAP_NET_RAW` + `CAP_NET_ADMIN`.
+
+```bash
+# Grant capabilities without running as root:
+sudo setcap cap_net_raw,cap_net_admin+ep ./sockslender
+```
+
+On startup, the tool automatically checks for raw socket and TCP_REPAIR availability and warns if missing.
+
+---
+
+### Rules Reference
+
+#### `fakets` — Fake with TCP Timestamp
+
+Sends a fake packet like `fake`, but includes a valid-looking TCP Timestamp option. Some advanced DPI systems detect regular `fake` packets because they lack TCP options that a real connection would have. `fakets` makes the fake packet harder to distinguish from real traffic.
+
+```
+socks5://?L3R:fakets=3?1.2.3.4:1080
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| Value | TTL value (should be low enough to expire before reaching the real server) |
+
+```
+DPI sees:
+  [FAKE+Timestamp] → looks like real traffic → reassembles wrong data
+  [REAL]           → DPI already confused
+```
+
+---
+
+#### `spoof` — IP Spoofed Fake Packet
+
+Sends a fake data packet with a forged source IP address. The DPI middlebox sees a packet from a completely different IP, which pollutes its connection tracking table and confuses reassembly.
+
+```
+socks5://?L3R:spoof=192.168.1.100?1.2.3.4:1080
+socks5://?L3R:spoof=random?1.2.3.4:1080
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `IP address` | Specific source IP to forge |
+| `random` / `rand` | Generate a random source IP for each connection |
+
+```
+Normal:     Client(10.0.0.5) ──→ DPI ──→ Server
+With spoof: Fake(192.168.1.100) ──→ DPI (confused)
+            Real(10.0.0.5) ──→ DPI ──→ Server
+```
+
+> **Note:** The spoofed packet is not expected to reach the server or get a response. Its only purpose is to inject garbage into the DPI's reassembly buffer.
+
+---
+
+#### `spoofrst` — RST from Spoofed IP
+
+Sends a TCP RST packet with a forged source IP. The DPI may think the connection was terminated by a third party, causing it to stop tracking the flow.
+
+```
+socks5://?L3R:spoofrst=10.0.0.1?1.2.3.4:1080
+socks5://?L3R:spoofrst=random?1.2.3.4:1080
+```
+
+---
+
+#### `ipfrag` — IP Fragmentation
+
+Builds a complete fake TCP packet and then fragments it at the IP level into small pieces. Most DPI systems have poor or no IP fragment reassembly, so they either:
+- See only the first fragment (incomplete data, cannot inspect)
+- Drop the fragments and miss the real packet that follows
+
+```
+socks5://?L3R:ipfrag=24?1.2.3.4:1080
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| Value | Fragment size in bytes (will be aligned to 8-byte boundary, minimum 8) |
+
+```
+Without ipfrag:
+  [Full Fake Packet 200B] → DPI inspects entire payload
+
+With ipfrag=24:
+  [Frag1 24B][Frag2 24B][Frag3 24B]... → DPI cannot reassemble
+  [Real Packet] → passes through
+```
+
+---
+
+#### `revfrag` — Reversed IP Fragmentation
+
+Same as `ipfrag`, but sends fragments in reverse order (last fragment first). This exploits DPI systems that process fragments in arrival order without waiting for complete reassembly.
+
+```
+socks5://?L3R:revfrag=24?1.2.3.4:1080
+```
+
+```
+Normal fragment order:  [Frag1] [Frag2] [Frag3]
+Reversed:               [Frag3] [Frag2] [Frag1]
+
+DPI tries to process Frag3 first → offset doesn't start at 0 → confused
+```
+
+---
+
+#### `multifake` — Multiple Fake Packets
+
+Sends multiple fake packets in rapid succession, each with a different random low TTL (1-4). This floods the DPI with garbage data across multiple TTL values, making it much harder to filter out fake packets by TTL alone.
+
+```
+socks5://?L3R:multifake=5?1.2.3.4:1080
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| Value | Number of fake packets to send (recommended: 3-10) |
+
+```
+[Fake1 TTL=2] [Fake2 TTL=4] [Fake3 TTL=1] [Fake4 TTL=3] [Fake5 TTL=2]
+[Real Packet TTL=64]
+
+DPI has 5 different "versions" of the data → cannot determine which is real
+```
+
+---
+
+#### `spooffrag` — Spoofed + Fragmented
+
+Combines IP spoofing with IP fragmentation. Sends a fragmented fake packet from a forged source IP. This is the most aggressive DPI confusion technique, combining two layers of obfuscation.
+
+```
+socks5://?L3R:spooffrag=1.2.3.4:24?server:1080
+socks5://?L3R:spooffrag=random:16?server:1080
+```
+
+| Parameter | Format | Description |
+|-----------|--------|-------------|
+| Value | `IP:fragsize` | Source IP (or `random`) followed by colon and fragment size |
+
+---
+
+#### `synfake` — Fake SYN with Payload
+
+Sends a SYN packet (with sequence number - 1) carrying a payload. This is unusual because real SYN packets don't carry application data. Some DPI systems process SYN payload, which causes them to misalign their TCP stream tracking.
+
+```
+socks5://?L3R:synfake=3?1.2.3.4:1080
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| Value | TTL value |
+
+---
+
+### Startup Diagnostics
+
+The tool now checks raw socket capabilities on startup:
+
+```
+[*] Raw socket + TCP_REPAIR: OK
+```
+
+If capabilities are missing:
+
+```
+[!] WARNING: Cannot create raw sockets. L3R rules (fake/rst/disorder) will NOT work!
+    Fix: run as root, or: sudo setcap cap_net_raw,cap_net_admin+ep <binary>
+```
+
+```
+[!] WARNING: TCP_REPAIR unavailable. fake/rst/disorder seq numbers will be wrong!
+    Fix: sudo setcap cap_net_raw,cap_net_admin+ep <binary>
+```
+
+---
+
+### Recommended Combinations
+
+**Basic bypass:**
+```
+L3R:fake=3,L3R:split=5
+```
+
+**Aggressive bypass:**
+```
+L3R:multifake=3,L3R:disorder=5
+```
+
+**Maximum confusion:**
+```
+L3R:spooffrag=random:16,L3R:fake=3,L3R:split=5
+```
+
+**Anti-fingerprint:**
+```
+L3R:synfake=2,L3R:fakets=3,L3R:split=5
+```
+
+**Against advanced DPI:**
+```
+L3R:spoof=random,L3R:ipfrag=24,L3R:rst=2,L3R:seg=3
+```
+
+**Kitchen sink (use with caution):**
+```
+L3R:multifake=5,L3R:spooffrag=random:16,L3R:fakets=2,L3R:split=5
+```
+
+> **Warning:** More rules = more raw packets per connection = higher CPU and bandwidth usage. Start with simple combinations and escalate only if needed.
 
 ---
 
