@@ -7,6 +7,7 @@ import encoding.hex
 
 $if !windows {
 	#include <sys/resource.h>
+	#include <netinet/tcp.h>
 }
 
 struct C.rlimit {
@@ -15,6 +16,7 @@ mut:
 	rlim_max u64
 }
 
+fn C.syscall(int, ...int) i64
 fn C.getrlimit(int, &C.rlimit) int
 fn C.setrlimit(int, &C.rlimit) int
 
@@ -66,6 +68,8 @@ mut:
 	else_start   int
 	else_end     int
 	else_hex     []u8
+	l3_key       string
+	l3_val       string
 }
 
 struct Node {
@@ -192,13 +196,12 @@ fn record_failure(mut c Chain) {
 fn find_proxychains_bin() string {
 	for name in ['proxychains4', 'proxychains'] {
 		result := os.execute('which ${name}')
-		result_two := os.execute('/system/bin/which ${name}')
 		if result.exit_code == 0 {
 			found := result.output.trim_space()
 			if found.len > 0 {
 				return found
 			}
-		} else { if result_two.exit_code == 0 { found_two := result_two.output.trim_space(); if found_two.len > 0 { return found_two } }}
+		}
 	}
 	return ''
 }
@@ -212,6 +215,20 @@ fn find_prior_nodes(chains []Chain, endpoint_addr string) []Node {
 		}
 	}
 	return []Node{}
+}
+
+fn parse_host_port(addr string) (string, string) {
+	if addr.starts_with('[') {
+		close_bracket := addr.index(']') or { return '', '' }
+		host := addr[1..close_bracket]
+		if close_bracket + 1 < addr.len && addr[close_bracket + 1] == `:` {
+			port := addr[close_bracket + 2..]
+			return host, port
+		}
+		return host, ''
+	}
+	last_colon := addr.last_index(':') or { return addr, '' }
+	return addr[..last_colon], addr[last_colon + 1..]
 }
 
 fn gen_proxychains_conf(nodes []Node, box_id int, idx int) string {
@@ -245,20 +262,6 @@ fn gen_proxychains_conf(nodes []Node, box_id int, idx int) string {
 	}
 	os.write_file(path, lines.join('\n') + '\n') or { return '' }
 	return path
-}
-
-fn parse_host_port(addr string) (string, string) {
-	if addr.starts_with('[') {
-		close_bracket := addr.index(']') or { return '', '' }
-		host := addr[1..close_bracket]
-		if close_bracket + 1 < addr.len && addr[close_bracket + 1] == `:` {
-			port := addr[close_bracket + 2..]
-			return host, port
-		}
-		return host, ''
-	}
-	last_colon := addr.last_index(':') or { return addr, '' }
-	return addr[..last_colon], addr[last_colon + 1..]
 }
 
 fn is_snapshot_name(s string) bool {
@@ -322,7 +325,30 @@ fn parse_script(raw string) ![]Rule {
 			continue
 		}
 		mut rule := Rule{}
-		mut s := p.trim_space().replace('..', '-')
+		mut s := p.trim_space()
+
+		if s.starts_with('L3:') || s.starts_with('l3:') {
+			kv := s[3..]
+			eq_idx := kv.index('=') or { return error('L3: missing = in "${s}"') }
+			rule.mode = 'l3'
+			rule.l3_key = kv[..eq_idx].to_lower()
+			rule.l3_val = kv[eq_idx + 1..]
+			rules << rule
+			continue
+		}
+
+		if s.starts_with('L3R:') || s.starts_with('l3r:') {
+			kv := s[4..]
+			eq_idx := kv.index('=') or { return error('L3R: missing = in "${s}"') }
+			rule.mode = 'l3r'
+			rule.l3_key = kv[..eq_idx].to_lower()
+			rule.l3_val = kv[eq_idx + 1..]
+			rules << rule
+			continue
+		}
+
+		s = s.replace('..', '-')
+
 		if s.contains('if') {
 			action_cond := s.split('if')
 			if action_cond.len != 2 {
@@ -434,6 +460,348 @@ fn parse_uri(raw string) !Node {
 		pass: pass
 		script: script
 	}
+}
+
+fn parse_int_or_hex(s string) int {
+	if s.starts_with('0x') || s.starts_with('0X') {
+		bytes := hex.decode(s[2..]) or { return 0 }
+		mut val := u32(0)
+		for b in bytes {
+			val = (val << 8) | u32(b)
+		}
+		return int(val)
+	}
+	return s.int()
+}
+
+fn apply_l3(fd int, rules []Rule, verbose bool) {
+	$if !windows {
+		for rule in rules {
+			if rule.mode != 'l3' {
+				continue
+			}
+			match rule.l3_key {
+				'ttl' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 0, 2, &val, u32(4))
+					if verbose {
+						println('  [L3] TTL=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+					}
+				}
+				'tos' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 0, 1, &val, u32(4))
+					if verbose {
+						println('  [L3] TOS=0x${val:02x} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+					}
+				}
+				'mark' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 1, 36, &val, u32(4))
+					if verbose {
+						println('  [L3] MARK=${val} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
+					}
+				}
+				'bind' {
+					dev := rule.l3_val
+					res := C.setsockopt(fd, 1, 25, dev.str, u32(dev.len + 1))
+					if verbose {
+						println('  [L3] BIND=${dev} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
+					}
+				}
+				'df' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 0, 10, &val, u32(4))
+					if verbose {
+						println('  [L3] DF=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+					}
+				}
+				'tproxy' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 0, 19, &val, u32(4))
+					if verbose {
+						println('  [L3] TPROXY=${val} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
+					}
+				}
+				'keepalive' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 1, 9, &val, u32(4))
+					if verbose {
+						println('  [L3] KEEPALIVE=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+					}
+				}
+				'nodelay' {
+					mut val := parse_int_or_hex(rule.l3_val)
+					res := C.setsockopt(fd, 6, 1, &val, u32(4))
+					if verbose {
+						println('  [L3] NODELAY=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+					}
+				}
+				else {
+					if verbose {
+						println('  [L3] Unknown: ${rule.l3_key}')
+					}
+				}
+			}
+		}
+	}
+}
+
+fn ip_checksum(data []u8) u16 {
+	mut sum := u32(0)
+	mut i := 0
+	for i + 1 < data.len {
+		sum += u32((u16(data[i]) << 8) | u16(data[i + 1]))
+		i += 2
+	}
+	if i < data.len {
+		sum += u32(u16(data[i]) << 8)
+	}
+	for (sum >> 16) > 0 {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	return u16(~sum & 0xFFFF)
+}
+
+fn tcp_checksum(src_ip []u8, dst_ip []u8, tcp_data []u8) u16 {
+	tl := tcp_data.len
+	mut pseudo := []u8{len: 12 + tl}
+	for i in 0 .. 4 {
+		pseudo[i] = src_ip[i]
+		pseudo[4 + i] = dst_ip[i]
+	}
+	pseudo[8] = 0
+	pseudo[9] = 6
+	pseudo[10] = u8(tl >> 8)
+	pseudo[11] = u8(tl & 0xFF)
+	for i in 0 .. tl {
+		pseudo[12 + i] = tcp_data[i]
+	}
+	return ip_checksum(pseudo)
+}
+
+fn get_sock_info(fd int) ([]u8, u16, []u8, u16) {
+	$if !windows {
+		mut local_buf := [16]u8{}
+		mut remote_buf := [16]u8{}
+		mut alen := u32(16)
+		unsafe {
+			C.getsockname(fd, voidptr(&local_buf), &alen)
+			alen = u32(16)
+			C.getpeername(fd, voidptr(&remote_buf), &alen)
+		}
+		src_ip := [local_buf[4], local_buf[5], local_buf[6], local_buf[7]]
+		src_port := (u16(local_buf[2]) << 8) | u16(local_buf[3])
+		dst_ip := [remote_buf[4], remote_buf[5], remote_buf[6], remote_buf[7]]
+		dst_port := (u16(remote_buf[2]) << 8) | u16(remote_buf[3])
+		return src_ip, src_port, dst_ip, dst_port
+	}
+	return [u8(0), 0, 0, 0], u16(0), [u8(0), 0, 0, 0], u16(0)
+}
+
+fn get_tcp_seq(fd int) u32 {
+	$if !windows {
+		mut one := int(1)
+		mut zero := int(0)
+		if C.setsockopt(fd, 6, 19, &one, u32(4)) != 0 {
+			return u32(time.now().unix_milli() & 0xFFFFFFFF)
+		}
+		C.setsockopt(fd, 6, 20, &zero, u32(4))
+		mut seq := u32(0)
+		mut slen := u32(4)
+		C.getsockopt(fd, 6, 21, &seq, &slen)
+		C.setsockopt(fd, 6, 19, &zero, u32(4))
+		return seq
+	}
+	return 0
+}
+
+fn build_raw_tcp(src_ip []u8, dst_ip []u8, src_port u16, dst_port u16, seq u32, ack u32, flags u8, ttl u8, payload []u8) []u8 {
+	total := 40 + payload.len
+	mut pkt := []u8{len: total}
+	pkt[0] = 0x45
+	pkt[2] = u8(total >> 8)
+	pkt[3] = u8(total & 0xFF)
+	pkt[4] = 0xDE
+	pkt[5] = 0xAD
+	pkt[6] = 0x40
+	pkt[8] = ttl
+	pkt[9] = 6
+	for i in 0 .. 4 {
+		pkt[12 + i] = src_ip[i]
+		pkt[16 + i] = dst_ip[i]
+	}
+	ck := ip_checksum(pkt[..20])
+	pkt[10] = u8(ck >> 8)
+	pkt[11] = u8(ck & 0xFF)
+	pkt[20] = u8(src_port >> 8)
+	pkt[21] = u8(src_port & 0xFF)
+	pkt[22] = u8(dst_port >> 8)
+	pkt[23] = u8(dst_port & 0xFF)
+	pkt[24] = u8(seq >> 24)
+	pkt[25] = u8((seq >> 16) & 0xFF)
+	pkt[26] = u8((seq >> 8) & 0xFF)
+	pkt[27] = u8(seq & 0xFF)
+	pkt[28] = u8(ack >> 24)
+	pkt[29] = u8((ack >> 16) & 0xFF)
+	pkt[30] = u8((ack >> 8) & 0xFF)
+	pkt[31] = u8(ack & 0xFF)
+	pkt[32] = 0x50
+	pkt[33] = flags
+	pkt[34] = 0xFF
+	pkt[35] = 0xFF
+	for i in 0 .. payload.len {
+		pkt[40 + i] = payload[i]
+	}
+	tc := tcp_checksum(pkt[12..16], pkt[16..20], pkt[20..])
+	pkt[36] = u8(tc >> 8)
+	pkt[37] = u8(tc & 0xFF)
+	return pkt
+}
+
+fn send_raw_packet(dst_ip []u8, dst_port u16, pkt []u8) bool {
+	$if !windows {
+		raw_fd := C.syscall(41, 2, 3, 255) // SYS_socket=41, AF_INET=2, SOCK_RAW=3, IPPROTO_RAW=255
+		if raw_fd < 0 {
+			return false
+		}
+		mut one := int(1)
+		C.setsockopt(int(raw_fd), 0, 3, &one, u32(4))
+		mut dest := [16]u8{}
+		dest[0] = 2
+		dest[2] = u8(dst_port >> 8)
+		dest[3] = u8(dst_port & 0xFF)
+		dest[4] = dst_ip[0]
+		dest[5] = dst_ip[1]
+		dest[6] = dst_ip[2]
+		dest[7] = dst_ip[3]
+		unsafe {
+			C.sendto(int(raw_fd), voidptr(pkt.data), pkt.len, 0, voidptr(&dest), u32(16))
+		}
+		C.close(int(raw_fd))
+		return true
+	}
+	return false
+}
+
+fn has_l3r_rules(script []Rule) bool {
+	for r in script {
+		if r.mode == 'l3r' {
+			return true
+		}
+	}
+	return false
+}
+
+fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bool {
+	fd := conn.sock.handle
+	for rule in script {
+		if rule.mode != 'l3r' {
+			continue
+		}
+		match rule.l3_key {
+			'fake' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq := get_tcp_seq(fd)
+					mut fake_payload := []u8{len: data.len}
+					for i in 0 .. fake_payload.len {
+						fake_payload[i] = u8(0x41 + (i % 26))
+					}
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
+					if send_raw_packet(dst_ip, dst_port, pkt) && verbose {
+						println('  [L3R] FAKE sent: TTL=${ttl}, ${fake_payload.len} bytes')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'rst' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq := get_tcp_seq(fd)
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x04, u8(ttl), []u8{})
+					if send_raw_packet(dst_ip, dst_port, pkt) && verbose {
+						println('  [L3R] FAKE RST sent: TTL=${ttl}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'split' {
+				pos := parse_int_or_hex(rule.l3_val)
+				if pos > 0 && pos < data.len {
+					conn.write(data[..pos]) or { return false }
+					time.sleep(1 * time.millisecond)
+					conn.write(data[pos..]) or { return false }
+					if verbose {
+						println('  [L3R] SPLIT at ${pos}: ${pos}+${data.len - pos} bytes')
+					}
+					return true
+				}
+			}
+			'disorder' {
+				$if !windows {
+					pos := parse_int_or_hex(rule.l3_val)
+					if pos > 0 && pos < data.len {
+						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+						seq := get_tcp_seq(fd)
+						pkt2 := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + u32(pos), 0, 0x18, 64, data[pos..])
+						send_raw_packet(dst_ip, dst_port, pkt2)
+						time.sleep(1 * time.millisecond)
+						conn.write(data[..pos]) or { return false }
+						conn.write(data[pos..]) or { return false }
+						if verbose {
+							println('  [L3R] DISORDER at ${pos}')
+						}
+						return true
+					}
+				}
+			}
+			'oob' {
+				$if !windows {
+					oob_data := hex.decode(rule.l3_val) or { continue }
+					if oob_data.len > 0 {
+						unsafe {
+							C.send(fd, voidptr(oob_data.data), oob_data.len, 1)
+						}
+						if verbose {
+							println('  [L3R] OOB sent: ${rule.l3_val}')
+						}
+						time.sleep(1 * time.millisecond)
+					}
+				}
+			}
+			'seg' {
+				seg_size := parse_int_or_hex(rule.l3_val)
+				if seg_size > 0 && seg_size < data.len {
+					mut offset := 0
+					for offset < data.len {
+						mut end := offset + seg_size
+						if end > data.len {
+							end = data.len
+						}
+						conn.write(data[offset..end]) or { return false }
+						offset = end
+						if offset < data.len {
+							time.sleep(1 * time.millisecond)
+						}
+					}
+					if verbose {
+						println('  [L3R] SEG: ${data.len} bytes in ${seg_size}-byte chunks')
+					}
+					return true
+				}
+			}
+			else {
+				if verbose {
+					println('  [L3R] Unknown: ${rule.l3_key}')
+				}
+			}
+		}
+	}
+	conn.write(data) or { return false }
+	return true
 }
 
 fn main() {
@@ -765,6 +1133,7 @@ fn main() {
 				}
 			}
 		}
+
 		if rrr_entries.len > 0 {
 			pc_bin := find_proxychains_bin()
 			if pc_bin == '' {
@@ -774,13 +1143,11 @@ fn main() {
 				for rrr_idx, entry in rrr_entries {
 					rrr_cmd_str := entry[0]
 					rrr_endpoint := entry[1]
-
 					mut ep_addr := rrr_endpoint
 					if !ep_addr.contains(':') {
 						eprintln('[!] [Box ${box_idx + 1}] -rrr: invalid endpoint (missing port): ${rrr_endpoint}')
 						continue
 					}
-
 					mut prior := find_prior_nodes(chains, ep_addr)
 					if prior.len == 0 {
 						for proto_prefix in ['socks5://', 'http://'] {
@@ -803,34 +1170,28 @@ fn main() {
 						}
 						continue
 					}
-
 					conf_path := gen_proxychains_conf(prior, box_idx + 1, rrr_idx)
 					if conf_path == '' {
 						eprintln('[!] -rrr: failed to write proxychains config')
 						continue
 					}
-
 					cmd_parts := rrr_cmd_str.split(' ').filter(it != '')
 					if cmd_parts.len == 0 {
 						continue
 					}
-
 					mut pc_args := ['-q', '-f', conf_path]
 					for cp in cmd_parts {
 						pc_args << cp
 					}
-
 					mut p := os.new_process(pc_bin)
 					p.set_args(pc_args)
 					p.run()
-
 					check_node := parse_uri(rrr_endpoint) or {
 						parse_uri('socks5://' + rrr_endpoint) or {
 							eprintln('[!] -rrr: cannot parse endpoint for monitoring')
 							continue
 						}
 					}
-
 					wd.mu.@lock()
 					wd.procs << ManagedProcess{
 						cmd: pc_bin
@@ -841,7 +1202,6 @@ fn main() {
 						last_restart: time.now()
 					}
 					wd.mu.unlock()
-
 					mut chain_desc := []string{}
 					for n in prior {
 						pt := match n.proto {
@@ -872,7 +1232,6 @@ fn main() {
 			verbose: verbose
 		}
 		apps << app
-
 		println('[*] [Box ${app.id}] Parsed successfully. ${listeners.len} listener(s), ${chains.len} routing chain(s).')
 		if verbose {
 			println('    -> VERBOSE mode enabled for this Box.')
@@ -883,7 +1242,6 @@ fn main() {
 		eprintln('[!] No valid boxes found to start.')
 		return
 	}
-
 	println('[*] Starting ${apps.len} independent Box(es)...')
 
 	spawn watchdog_loop(mut wd)
@@ -911,6 +1269,9 @@ fn apply_action(mut buf []u8, nr int, start int, hx []u8) {
 @[inline]
 fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 	for rule in script {
+		if rule.mode == 'l3' || rule.mode == 'l3r' {
+			continue
+		}
 		if rule.mode == 'aob' {
 			mut indices := []int{}
 			pat_len := rule.aob_pattern.len
@@ -969,6 +1330,7 @@ fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 @[inline]
 fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule, verbose bool) {
 	mut b := []u8{len: buf_size}
+	mut is_first := has_l3r_rules(script)
 	for {
 		nr := src.read(mut b) or { break }
 		if nr == 0 {
@@ -977,13 +1339,21 @@ fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule
 		if verbose {
 			println('\n[-] Traffic In (${nr} bytes): ${hex.encode(b[..nr])}')
 		}
+		mut data := b[..nr].clone()
 		if script.len > 0 {
-			apply_script(mut b, nr, script, verbose)
+			apply_script(mut data, data.len, script, verbose)
 			if verbose {
-				println('[+] Traffic Out (${nr} bytes): ${hex.encode(b[..nr])}')
+				println('[+] Traffic Out (${data.len} bytes): ${hex.encode(data)}')
 			}
 		}
-		dst.write(b[..nr]) or { break }
+		if is_first {
+			is_first = false
+			if !desync_write(mut dst, data, script, verbose) {
+				break
+			}
+		} else {
+			dst.write(data) or { break }
+		}
 	}
 	done <- true
 }
@@ -1013,19 +1383,11 @@ fn start_listener(mut app App, li int) {
 	if l.proto == .dns {
 		mut listener := net.listen_udp(l.addr) or { return }
 		println('[+] [Box ${app.id}] ${pname} on ${l.addr} (UDP)')
-
-		sem := chan bool{cap: 50}
-
 		for {
 			mut buf := []u8{len: 2048}
 			n, addr := listener.read(mut buf) or { continue }
 			if n > 0 {
-				select {
-					sem <- true {
-						spawn handle_dns_with_sem(mut app, mut listener, addr, buf[..n].clone(), l, sem)
-					}
-					else {}
-				}
+				spawn handle_dns_request(mut app, mut listener, addr, buf[..n].clone(), l)
 			}
 		}
 		return
@@ -1053,7 +1415,6 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 	if req.len < 12 {
 		return
 	}
-
 	mut order := if l.is_global {
 		pick_chain_order(mut app)
 	} else {
@@ -1062,26 +1423,23 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 	if order.len == 0 {
 		return
 	}
-
 	for ci in order {
 		app.mu.@lock()
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
-
 		if nodes.len == 0 || nodes[0].proto != .dns {
 			continue
 		}
-
 		up_addrs := net.resolve_addrs(nodes[0].addr, .ip, .udp) or { continue }
 		if up_addrs.len == 0 {
 			continue
 		}
-
 		mut out_conn := net.listen_udp('0.0.0.0:0') or { continue }
 		out_conn.set_read_timeout(500 * time.millisecond)
-
+		if nodes[0].script.len > 0 {
+			apply_l3(out_conn.sock.handle, nodes[0].script, app.verbose)
+		}
 		t0 := time.now()
-
 		out_conn.write_to(up_addrs[0], req) or {
 			out_conn.close() or {}
 			app.mu.@lock()
@@ -1089,7 +1447,6 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 			app.mu.unlock()
 			continue
 		}
-
 		mut resp_buf := []u8{len: 2048}
 		rn, _ := out_conn.read(mut resp_buf) or {
 			out_conn.close() or {}
@@ -1098,7 +1455,6 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 			app.mu.unlock()
 			continue
 		}
-
 		if rn > 0 {
 			lat := i64(time.now() - t0) / 1000
 			app.mu.@lock()
@@ -1108,7 +1464,6 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 			out_conn.close() or {}
 			return
 		}
-
 		out_conn.close() or {}
 	}
 }
@@ -1120,7 +1475,6 @@ fn health_checker(mut app App) {
 			alive := check_chain(app.chains[ci])
 			d := time.now() - t0
 			lat_us := i64(d) / 1000
-
 			app.mu.@lock()
 			app.chains[ci].alive = alive
 			if alive {
@@ -1321,7 +1675,6 @@ fn connect_retry(mut app App, host string, port int, l Listener) !(&net.TcpConn,
 		app.mu.@lock()
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
-
 		t0 := time.now()
 		conn := connect_chain(nodes, host, port) or {
 			app.mu.@lock()
@@ -1343,6 +1696,9 @@ fn connect_chain(chain []Node, host string, port int) !&net.TcpConn {
 		return error('empty chain')
 	}
 	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial failed') }
+	if chain[0].script.len > 0 {
+		apply_l3(conn.sock.handle, chain[0].script, false)
+	}
 	match chain[0].proto {
 		.socks5 {
 			do_socks5_hs(mut conn, chain[0], host, port) or {
@@ -1467,7 +1823,13 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 	}
 	needed := 2 + int(greet[1])
 	if gn < needed {
-		read_full(mut client, mut greet, needed) or { return }
+		for gn < needed {
+			n := client.read(mut greet[gn..]) or { return }
+			if n == 0 {
+				return
+			}
+			gn += n
+		}
 	}
 	if l.user != '' {
 		client.write([u8(0x05), 0x02]) or { return }
@@ -1479,11 +1841,23 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 		}
 		ulen := int(auth[1])
 		if an < 2 + ulen + 1 {
-			an = read_full(mut client, mut auth, 2 + ulen + 1) or { return }
+			for an < 2 + ulen + 1 {
+				n := client.read(mut auth[an..]) or { return }
+				if n == 0 {
+					return
+				}
+				an += n
+			}
 		}
 		plen := int(auth[2 + ulen])
 		if an < 2 + ulen + 1 + plen {
-			read_full(mut client, mut auth, 2 + ulen + 1 + plen) or { return }
+			for an < 2 + ulen + 1 + plen {
+				n := client.read(mut auth[an..]) or { return }
+				if n == 0 {
+					return
+				}
+				an += n
+			}
 		}
 		if auth[2..2 + ulen].bytestr() != l.user
 			|| auth[3 + ulen..3 + ulen + plen].bytestr() != l.pass {
@@ -1503,25 +1877,49 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 	match atyp {
 		0x01 {
 			if rn < 10 {
-				rn = read_full(mut client, mut req, 10) or { return }
+				for rn < 10 {
+					n := client.read(mut req[rn..]) or { return }
+					if n == 0 {
+						return
+					}
+					rn += n
+				}
 			}
 			host = '${req[4]}.${req[5]}.${req[6]}.${req[7]}'
 			port = (u16(req[8]) << 8) | u16(req[9])
 		}
 		0x03 {
 			if rn < 5 {
-				rn = read_full(mut client, mut req, 5) or { return }
+				for rn < 5 {
+					n := client.read(mut req[rn..]) or { return }
+					if n == 0 {
+						return
+					}
+					rn += n
+				}
 			}
 			dl := int(req[4])
 			if rn < 5 + dl + 2 {
-				rn = read_full(mut client, mut req, 5 + dl + 2) or { return }
+				for rn < 5 + dl + 2 {
+					n := client.read(mut req[rn..]) or { return }
+					if n == 0 {
+						return
+					}
+					rn += n
+				}
 			}
 			host = req[5..5 + dl].bytestr()
 			port = (u16(req[5 + dl]) << 8) | u16(req[5 + dl + 1])
 		}
 		0x04 {
 			if rn < 22 {
-				rn = read_full(mut client, mut req, 22) or { return }
+				for rn < 22 {
+					n := client.read(mut req[rn..]) or { return }
+					if n == 0 {
+						return
+					}
+					rn += n
+				}
 			}
 			mut hp := []string{}
 			for j in 0 .. 8 {
@@ -1544,9 +1942,6 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 		client.write([u8(0x05), 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) or {}
 		return
 	}
-	//defer {
-		//upstream.close() or {}
-	//}
 	mut ok := []u8{len: 10}
 	ok[0] = 0x05
 	ok[3] = 0x01
@@ -1611,9 +2006,6 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 			client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'.bytes()) or {}
 			return
 		}
-		defer {
-			upstream.close() or {}
-		}
 		client.write('HTTP/1.1 200 Connection Established\r\n\r\n'.bytes()) or { return }
 		do_relay(mut client, mut upstream, script, app.verbose)
 	} else {
@@ -1638,9 +2030,6 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 		mut upstream, script := connect_retry(mut app, t_host, t_port, l) or {
 			client.write('HTTP/1.1 502 Bad Gateway\r\n\r\n'.bytes()) or {}
 			return
-		}
-		defer {
-			upstream.close() or {}
 		}
 		mut new_hdr := '${method} ${path} ${parts[2]}\r\n'
 		for li2 in 1 .. lines.len {
@@ -1675,14 +2064,17 @@ fn handle_sni(mut app App, mut client net.TcpConn, l Listener) {
 		return
 	}
 	mut upstream, script := connect_retry(mut app, hostname, 443, l) or { return }
-	defer {
-		upstream.close() or {}
-	}
 	mut payload := initial.clone()
 	if script.len > 0 {
 		apply_script(mut payload, payload.len, script, app.verbose)
 	}
-	upstream.write(payload) or { return }
+	if has_l3r_rules(script) {
+		if !desync_write(mut upstream, payload, script, app.verbose) {
+			return
+		}
+	} else {
+		upstream.write(payload) or { return }
+	}
 	do_relay(mut client, mut upstream, script, app.verbose)
 }
 
@@ -1840,11 +2232,9 @@ fn tcp_udp_monitor(mut client net.TcpConn, mut relay_conn net.UdpConn, mut out n
 fn watchdog_loop(mut wd Watchdog) {
 	for {
 		time.sleep(15 * time.second)
-
 		wd.mu.@lock()
 		count := wd.procs.len
 		wd.mu.unlock()
-
 		for idx in 0 .. count {
 			wd.mu.@lock()
 			if idx >= wd.procs.len {
@@ -1899,7 +2289,6 @@ fn watchdog_loop(mut wd Watchdog) {
 				wd.mu.unlock()
 				break
 			}
-
 			new_rc := wd.procs[idx].restart_count + 1
 			pname := match check_node.proto {
 				.socks5 { 'SOCKS5' }
@@ -1907,13 +2296,11 @@ fn watchdog_loop(mut wd Watchdog) {
 				.dns { 'DNS' }
 				.sni { 'TCP' }
 			}
-
 			if proc_alive {
 				println('\n[!] [Watchdog] FREEZE DETECTED: "${cmd}" alive but ${pname} handshake failed at ${check_node.addr} (restart #${new_rc})')
 			} else {
 				println('\n[!] [Watchdog] CRASH DETECTED: "${cmd}" is dead (restart #${new_rc})')
 			}
-
 			if wd.procs[idx].proc.is_alive() {
 				wd.procs[idx].proc.signal_kill()
 			}
@@ -1926,7 +2313,6 @@ fn watchdog_loop(mut wd Watchdog) {
 				new_p.set_args(new_args)
 			}
 			new_p.run()
-
 			wd.procs[idx].proc = new_p
 			wd.procs[idx].last_restart = time.now()
 			wd.procs[idx].restart_count = new_rc
@@ -1939,23 +2325,15 @@ fn watchdog_loop(mut wd Watchdog) {
 					break
 				}
 			}
-
 			if conf_path != '' {
 				println('    -> Restarted via proxychains (PID: ${new_p.pid}). Next check in ${next_cd}s.')
 			} else {
 				println('    -> Restarted (PID: ${new_p.pid}). Next check in ${next_cd}s.')
 			}
-
 			if new_rc >= 5 {
 				println('    [!] WARNING: "${cmd}" restarted ${new_rc} times!')
 			}
-
 			wd.mu.unlock()
 		}
 	}
-}
-
-fn handle_dns_with_sem(mut app App, mut listener net.UdpConn, client_addr net.Addr, req []u8, l Listener, sem chan bool) {
-	defer { _ := <-sem }
-	handle_dns_request(mut app, mut listener, client_addr, req, l)
 }

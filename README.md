@@ -3,12 +3,10 @@
 apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/sockslender && cd sockslender && v -enable-globals -prod sockslender.v -o sockslender && ln -sf $(pwd)/sockslender $PREFIX/bin/sockslender && sockslender
 ```
 
----
-
 <p align="center">
   <h1 align="center">SockSlender</h1>
   <p align="center">
-    <b>Lightweight, multi-protocol proxy router & chain manager</b>
+    <b>Lightweight, multi-protocol proxy router & chain manager with DPI desync</b>
   </p>
   <p align="center">
     Written in <a href="https://vlang.io">V</a> — Single binary, zero dependencies, blazing fast
@@ -25,23 +23,24 @@ apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2
 
 ## What is SockSlender?
 
-SockSlender is a **proxy chain router** that lets you combine multiple proxy servers into
-intelligent routing chains. It supports **SOCKS5, HTTP CONNECT, SNI (TLS), and DNS** protocols,
-with automatic failover, health monitoring, and smart server selection.
+SockSlender is a **proxy chain router** that combines multiple proxy servers into
+intelligent routing chains with **DPI evasion**, automatic failover, health monitoring,
+and smart server selection.
 
-Think of it as a **programmable proxy multiplexer** — receive connections on one side,
-route them through chains of proxies on the other side, with automatic health checking
-and the fastest server always selected first.
+Think of it as a **programmable proxy multiplexer with built-in anti-censorship** —
+receive connections on one side, route them through chains of proxies on the other side,
+while actively defeating Deep Packet Inspection.
 
 ```
-              ┌─────────────┐
- Client ────→│ SockSlender   │ ──→ Proxy A ──→ Proxy B ──→ Internet
- 		      │              │ ──→ Proxy C ──→ Internet (failover)
- Client ────→│  SOCKS5       │ ──→ Proxy D ──→ Internet (fastest)
- Client ────→│  HTTP         │
- Client ────→│  SNI          │
- DNS    ────→│  DNS          │ ──→ DNS Server 1 / DNS Server 2
-              └─────────────┘
+              ┌─────────────────┐
+ Client ────→│   SockSlender     │ ──→ Proxy A ──→ Proxy B ──→ Internet             
+               │                  │ ──→ Proxy C ──→ Internet (failover)
+ Client ────→ │ Script Engine:  │ ──→ Proxy D ──→ Internet (fastest)
+                │  L7: byte patch│
+ Client ────→ │  L3: TTL/TOS    │
+               │  L3R: DPI desync │
+ DNS    ────→│  DNS forwarding   │ ──→ DNS Server 1 / DNS Server 2
+              └─────────────────┘
 ```
 
 ---
@@ -63,8 +62,11 @@ v -prod -cc gcc sockslender.v
 # HTTP listener → chain of two proxies
 ./sockslender -l http://0.0.0.0:8080 -u socks5://first:1010+socks5://second:2020
 
-# SNI listener → direct upstream
-./sockslender -l sni://0.0.0.0:443 -u sni://backend:443
+# SNI listener with DPI desync (no root needed)
+./sockslender -l sni://0.0.0.0:443 -u 'sni://backend:443?L3R:split=3?'
+
+# SNI listener with full DPI desync (root required)
+./sockslender -l sni://0.0.0.0:443 -u 'sni://backend:443?L3R:fake=3,L3R:split=3?'
 
 # DNS forwarder
 ./sockslender -l dns://0.0.0.0:53 -u dns://8.8.8.8:53
@@ -81,11 +83,14 @@ v -prod -cc gcc sockslender.v
 - [Routing Modes](#-routing-modes)
 - [Authentication](#-authentication)
 - [Smart Chain Selection](#-smart-chain-selection)
-- [Script Engine](#-script-engine)
+- [Script Engine — L7 (Application Layer)](#-script-engine--l7-application-layer)
+- [Script Engine — L3 (Network Layer)](#-script-engine--l3-network-layer)
+- [Script Engine — L3R (Raw Socket DPI Desync)](#-script-engine--l3r-raw-socket-dpi-desync)
 - [Process Management](#-process-management)
 - [Multi-Box Architecture](#-multi-box-architecture)
 - [Advanced Examples](#-advanced-examples)
 - [Platform Notes](#-platform-notes)
+- [Architecture](#-architecture)
 
 ---
 
@@ -99,7 +104,9 @@ v -prod -cc gcc sockslender.v
 | **Health Monitoring** | Continuous health checks with circuit breaker |
 | **Failover** | Automatic fallback when upstream dies |
 | **Authentication** | Username/password for listeners & upstreams |
-| **Script Engine** | Modify packets on-the-fly (byte patching) |
+| **L7 Script Engine** | Modify payload bytes on-the-fly |
+| **L3 Socket Options** | TTL, TOS, MARK, interface binding |
+| **L3R DPI Desync** | Raw socket: fake, RST, split, disorder, OOB, segmentation |
 | **Process Manager** | Launch, monitor & auto-restart background processes |
 | **ProxyChains Tunnel** | Tunnel child processes through chain segments |
 | **Multi-Box** | Run independent proxy instances in one process |
@@ -116,10 +123,7 @@ v -prod -cc gcc sockslender.v
 Full SOCKS5 implementation with CONNECT, UDP ASSOCIATE, and username/password authentication.
 
 ```bash
-# Listen as SOCKS5, forward to SOCKS5 upstream
 ./sockslender -l socks5://0.0.0.0:1080 -u socks5://upstream:1234
-
-# With authentication on both sides
 ./sockslender -l socks5://admin:secret@0.0.0.0:1080 -u socks5://user:pass@upstream:1234
 ```
 
@@ -128,10 +132,7 @@ Full SOCKS5 implementation with CONNECT, UDP ASSOCIATE, and username/password au
 HTTP proxy with CONNECT method support and Basic authentication.
 
 ```bash
-# Listen as HTTP proxy
 ./sockslender -l http://0.0.0.0:8080 -u socks5://upstream:1234
-
-# With auth
 ./sockslender -l http://user:pass@0.0.0.0:8080 -u http://user:pass@upstream:8080
 ```
 
@@ -141,7 +142,6 @@ Extracts hostname from TLS ClientHello SNI extension and routes accordingly.
 No TLS termination — traffic passes through encrypted.
 
 ```bash
-# SNI-based routing
 ./sockslender -l sni://0.0.0.0:443 -u sni://backend:443
 ```
 
@@ -150,7 +150,6 @@ No TLS termination — traffic passes through encrypted.
 DNS query forwarding over UDP with automatic failover between DNS servers.
 
 ```bash
-# DNS forwarder with failover
 ./sockslender -l dns://0.0.0.0:53 -u dns://8.8.8.8:53 -u dns://1.1.1.1:53
 ```
 
@@ -167,7 +166,7 @@ DNS query forwarding over UDP with automatic failover between DNS servers.
 | `-v` | Enable verbose/packet dump mode | `-v` |
 | `-r?CMD?` | Run background command | `-r?tor --SocksPort 9050?` |
 | `-rr?CMD,EP?` | Run + auto-restart on failure | `-rr?tor,127.0.0.1:9050?` |
-| `-rrr?CMD,EP?` | Run via proxychains tunnel | `-rrr?tor,127.0.0.1:9050?` |
+| `-rrr?CMD,EP?` | Run via proxychains tunnel (Linux) | `-rrr?tor,127.0.0.1:9050?` |
 | `::` | Separator between independent Boxes | `... :: ...` |
 
 ---
@@ -183,13 +182,8 @@ PROTOCOL://[USER:PASS@]HOST:PORT[?SCRIPT?]
 ### Simple Chain
 
 ```bash
-# Single hop
 -u socks5://proxy:1234
-
-# Two hops
 -u socks5://first:1010+socks5://second:2020
-
-# Three hops with mixed protocols
 -u socks5://entry:1010+http://middle:8080+socks5://exit:9050
 ```
 
@@ -198,17 +192,9 @@ PROTOCOL://[USER:PASS@]HOST:PORT[?SCRIPT?]
 Save and reuse chain segments using uppercase names:
 
 ```bash
-# Save segment as "ENTRY", then use it
 -u socks5://a:1010+socks5://b:2020+-xENTRY \
 -u ENTRY+socks5://c:3030 \
 -u ENTRY+socks5://d:4040
-```
-
-This creates:
-```
-Chain 0: a:1010 → b:2020  (saved as ENTRY)
-Chain 1: a:1010 → b:2020 → c:3030
-Chain 2: a:1010 → b:2020 → d:4040
 ```
 
 ### Mid-Chain Listener (`-x`)
@@ -219,7 +205,6 @@ Split a chain and create a listener at any point:
 -i socks5://a:1010+socks5://b:2020+-xsocks5://0.0.0.0:4040+socks5://c:3030
 ```
 
-This creates:
 ```
 Listener on :4040 → Chain [a:1010, b:2020]     (only nodes before -x)
 Upstream chain   → [a:1010, b:2020, c:3030]     (full chain)
@@ -230,11 +215,7 @@ Upstream chain   → [a:1010, b:2020, c:3030]     (full chain)
 Append nodes to ALL existing chains:
 
 ```bash
--u socks5://a:1010 \
--u socks5://b:2020 \
--o socks5://exit:9050
-
-# Result:
+-u socks5://a:1010 -u socks5://b:2020 -o socks5://exit:9050
 # Chain 0: a:1010 → exit:9050
 # Chain 1: b:2020 → exit:9050
 ```
@@ -245,7 +226,7 @@ Append nodes to ALL existing chains:
 
 ### Global Upstream (`-u`)
 
-All listeners share these chains. Best chain is auto-selected.
+All listeners share these chains. Best chain is auto-selected:
 
 ```bash
 ./sockslender \
@@ -254,8 +235,6 @@ All listeners share these chains. Best chain is auto-selected.
   -u socks5://fast-server:1010 \
   -u socks5://backup-server:2020
 ```
-
-Both listeners use the same pool of upstreams with smart selection.
 
 ### Dedicated Routing (`-i` with `-x`)
 
@@ -268,113 +247,65 @@ Bind specific chains to specific listeners:
   -i socks5://special-proxy:2020+-xhttp://0.0.0.0:8080
 ```
 
-- `:1080` (SOCKS5) → uses `default-proxy:1010`
-- `:8080` (HTTP) → uses `special-proxy:2020` only
-
-### Multiple Upstreams (Failover + Load Balancing)
-
-```bash
-./sockslender \
-  -l socks5://0.0.0.0:1080 \
-  -u socks5://server-us:1010 \
-  -u socks5://server-eu:2020 \
-  -u socks5://server-asia:3030
-```
-
-SockSlender automatically:
-1. Health-checks all servers every 20 seconds
-2. Measures latency with EMA (Exponential Moving Average)
-3. Tracks success/failure rates
-4. Routes to the best server first
-5. Falls back to others if the best fails
-
 ---
 
 ## Authentication
 
-### Listener Authentication
-
-Require clients to authenticate:
-
 ```bash
-# SOCKS5 with auth
+# Listener auth
 -l socks5://admin:secret123@0.0.0.0:1080
-
-# HTTP with Basic auth
 -l http://user:pass@0.0.0.0:8080
-```
 
-### Upstream Authentication
-
-Authenticate to upstream proxies:
-
-```bash
+# Upstream auth
 -u socks5://myuser:mypass@proxy:1234
--u http://user:pass@httpproxy:8080
-```
 
-### Combined
-
-```bash
+# Combined
 ./sockslender \
-  -l socks5://admin:local-pass@0.0.0.0:1080 \
-  -u socks5://remote-user:remote-pass@proxy:1234
+  -l socks5://admin:local@0.0.0.0:1080 \
+  -u socks5://remote:pass@proxy:1234
 ```
 
 ---
 
 ## Smart Chain Selection
 
-SockSlender uses an intelligent algorithm to always pick the best upstream:
-
 ### Scoring Formula
 
 ```
 Score = Reliability² × Speed
+
+Reliability = success_count / total_count
+Speed       = 1,000,000 / (EMA_latency + 100)
+EMA         = 0.7 × previous + 0.3 × current
 ```
 
-Where:
-- **Reliability** = `success_count / total_count` (0.0 to 1.0)
-- **Speed** = `1,000,000 / (EMA_latency + 100)`
-- **EMA Latency** = `0.7 × previous + 0.3 × current` (smoothed)
-
 ### Circuit Breaker
-
-After **3 consecutive failures**, a chain is temporarily disabled:
 
 ```
 Failure 1-2:  Still tried (with penalty)
 Failure 3+:   Disabled for 30 seconds
-After 30s:    One probe attempt allowed
-Probe OK:     Fully restored (counter reset)
-Probe FAIL:   Disabled again for 30s
+After 30s:    One probe attempt
+Probe OK:     Fully restored
+Probe FAIL:   Disabled again
 ```
 
-### Example Scoring
+### Example
 
 ```
-Server A: 95% reliable, 50ms latency  → Score: 17.0  ★ Selected
-Server B: 70% reliable, 100ms latency → Score:  4.6
-Server C: 3 consecutive failures       → Score:  0.001 (disabled)
+Server A: 95% reliable, 50ms  → Score: 17.0  ★ Selected
+Server B: 70% reliable, 100ms → Score:  4.6
+Server C: 3 consecutive fails  → Score:  0.001 (disabled)
 ```
-
-### Recovery
-
-When a connection succeeds through a chain:
-- Success counter incremented
-- Consecutive failure counter reset to 0
-- EMA latency updated with actual measurement
-
-When a connection fails:
-- Failure counter incremented
-- Consecutive failure counter incremented
-- EMA latency penalized (×1.5 + 50ms)
 
 ---
 
-## Script Engine
+## Script Engine — L7 (Application Layer)
 
-Modify packets on-the-fly using byte-level scripts. Scripts are embedded in URIs between `?` markers:
+Modify packet payload bytes on-the-fly. Works on **all platforms**.
+
+### Syntax
+
+Scripts are embedded in URIs between `?` markers:
 
 ```
 socks5://proxy:1234?SCRIPT?
@@ -382,64 +313,241 @@ socks5://proxy:1234?SCRIPT?
 
 ### Unconditional Byte Patch
 
-```
-?START-END=HEX?
-```
-
-Replace bytes at offset range:
-
 ```bash
-# Set bytes 0-1 to 0x0505
 -u 'socks5://proxy:1234?0-1=0505?'
 ```
 
 ### Conditional Patch (if/else)
 
-```
-?ACTION if CONDITION?
-?ACTION if CONDITION el ELSE_ACTION?
-```
-
 ```bash
-# If byte at offset 0 is 0x16 (TLS), set byte 5 to 0x01
+# If byte 0 is 0x16 (TLS), set byte 5 to 0x01
 -u 'sni://proxy:443?5-5=01 if 0-0=16?'
 
-# If bytes 0-1 are 0x0500, patch offset 3; else patch offset 7
+# If/else
 -u 'socks5://proxy:1234?3-3=01 if 0-1=0500 el 7-7=FF?'
 ```
 
-### AOB Pattern Matching (Array of Bytes)
-
-```
-?PATTERN if ACTION?
-```
-
-Use `__` or `??` as wildcards:
+### AOB Pattern Matching
 
 ```bash
-# Find pattern 0x16__01 anywhere and patch relative offset +2
+# Find pattern, patch relative offset
 -u 'sni://proxy:443?1603__01 if 2-2=03?'
 ```
 
 ### Multiple Rules
 
-Separate rules with `,`:
-
 ```bash
 -u 'socks5://proxy:1234?0-0=05, 3-3=01 if 0-0=16?'
 ```
 
-### Verbose Mode
+### Use Cases
 
-Use `-v` to see all packet modifications:
+| Use Case | Script | Description |
+|---|---|---|
+| Anti-DPI byte patch | `0-0=17` | Change TLS record type |
+| SNI modification | AOB pattern match | Replace hostname bytes |
+| Protocol fix | `1-1=00 if 1-1=01` | Fix buggy proxy responses |
+| Fingerprint change | `46-47=c02c` | Alter cipher suite order |
+| Debug marker | `0-3=DEADBEEF` | Inject Wireshark marker |
+
+---
+
+## Script Engine — L3 (Network Layer)
+
+Control socket and IP header behavior. **Linux/macOS only.**
+
+### Syntax
+
+```
+L3:key=value
+```
+
+### No Root Required
+
+| Key | Description | Values | Use Case |
+|---|---|---|---|
+| `ttl` | IP Time-To-Live | `1`-`255` | DPI evasion, hop limiting |
+| `tos` | Type of Service / DSCP | `0x00`-`0xFF` | QoS, traffic priority |
+| `df` | Don't Fragment | `0`=off, `2`=on | Control fragmentation |
+| `nodelay` | TCP Nagle algorithm | `0`=off, `1`=on | Reduce latency |
+| `keepalive` | TCP Keep-Alive | `0`=off, `1`=on | Survive NAT timeouts |
+
+### Root Required
+
+| Key | Description | Values | Use Case |
+|---|---|---|---|
+| `mark` | Packet fwmark | integer | Policy routing with iptables |
+| `bind` | Bind to interface | `eth0`, `tun0`... | Force traffic path |
+| `tproxy` | Transparent proxy | `0`/`1` | Intercept without redirect |
+
+### Examples
 
 ```bash
-./sockslender -v -l socks5://0.0.0.0:1080 -u 'socks5://proxy:1234?0-0=05?'
+# Low latency gaming/VoIP
+-u 'socks5://proxy:1234?L3:tos=0xB8,L3:nodelay=1,L3:keepalive=1?'
 
-# Output:
-# [-] Traffic In (42 bytes): 050100...
-# [+] Unconditional action applied at offset 0.
-# [+] Traffic Out (42 bytes): 050100...
+# Policy routing (root)
+-u 'socks5://proxy:1234?L3:mark=100?'
+# Then: ip rule add fwmark 100 table vpn
+
+# Force VPN interface (root)
+-u 'socks5://proxy:1234?L3:bind=tun0?'
+
+# DPI evasion with TTL
+-u 'sni://proxy:443?L3:ttl=3?'
+```
+
+### TOS/DSCP Quick Reference
+
+| TOS Value | DSCP | Priority | Best For |
+|---|---|---|---|
+| `0x10` | CS1 | Low delay | Interactive |
+| `0x08` | — | High throughput | Bulk transfer |
+| `0x28` | AF11 | Assured Forward | Business |
+| `0xB8` | EF | Expedited Forward | VoIP, gaming |
+
+---
+
+## Script Engine — L3R (Raw Socket DPI Desync)
+
+Advanced DPI evasion using raw sockets. Similar techniques to **zapret**, **GoodbyeDPI**,
+and **ByeDPI**, integrated directly into SockSlender's Script Engine.
+
+### How DPI Desync Works
+
+```
+Normal (DPI sees everything):
+  Client ──[TLS ClientHello]──→ DPI ──→ Server
+                                 ↓
+                              BLOCKED!
+
+With Desync (DPI confused):
+  Client ──[Fake garbage TTL=3]──→ Router ──→ Router ──→ 💀 (dies)
+  Client ──[Real ClientHello]───→ Router ──→ Router ──→ DPI ──→ Server
+                                                         ↓
+                                              Confused by fake → PASS ✅
+```
+
+### Syntax
+
+```
+L3R:technique=value
+```
+
+### Available Techniques
+
+| Technique | Root? | Description | Effectiveness |
+|---|---|---|---|
+| `split=N` | ❌ | Split first packet at byte N | ★★★☆☆ Good vs simple DPI |
+| `seg=N` | ❌ | Send in N-byte micro-segments | ★★★☆☆ Good but slow |
+| `oob=HEX` | ❌ | Send TCP urgent/OOB data | ★★☆☆☆ Some DPI |
+| `fake=TTL` | ✅ | Fake packet with low TTL | ★★★★★ Best vs stateful DPI |
+| `rst=TTL` | ✅ | Fake TCP RST with low TTL | ★★★★☆ Great vs session DPI |
+| `disorder=N` | ✅ | Send part 2 before part 1 | ★★★★☆ Great vs reassembly |
+
+### `L3R:split=N` — No Root Needed
+
+Splits the first packet at byte position N:
+
+```bash
+-u 'sni://proxy:443?L3R:split=3?'
+```
+
+```
+Without split:
+  [16 03 01 02 00 01 00 ... hostname ...]
+  DPI: "TLS ClientHello to blocked.com" → BLOCK
+
+With split=3:
+  Segment 1: [16 03 01]
+  Segment 2: [02 00 01 00 ... hostname ...]
+  DPI: can't reassemble → PASS ✅
+```
+
+### `L3R:seg=N` — No Root Needed
+
+Send in N-byte segments with 1ms delay:
+
+```bash
+-u 'sni://proxy:443?L3R:seg=1?'   # 1-byte segments (slow but effective)
+-u 'sni://proxy:443?L3R:seg=5?'   # 5-byte segments (balanced)
+```
+
+### `L3R:oob=HEX` — No Root Needed
+
+Send TCP Out-of-Band urgent data:
+
+```bash
+-u 'sni://proxy:443?L3R:oob=41?'
+```
+
+### `L3R:fake=TTL` — Root Required
+
+Send garbage packet with low TTL. DPI sees fake, real passes:
+
+```bash
+-u 'sni://proxy:443?L3R:fake=3?'
+```
+
+```
+Hop 1        Hop 2        Hop 3        Hop 4 (DPI)    Server
+[Fake TTL=3] [Fake TTL=2] [Fake TTL=1]  💀 dead
+[Real TTL=64][Real TTL=63][Real TTL=62] [Real TTL=61] ✅
+                                         DPI confused!
+```
+
+### `L3R:rst=TTL` — Root Required
+
+Fake TCP RST. DPI thinks connection closed:
+
+```bash
+-u 'sni://proxy:443?L3R:rst=3?'
+```
+
+### `L3R:disorder=N` — Root Required
+
+Send second part first via raw socket:
+
+```bash
+-u 'sni://proxy:443?L3R:disorder=5?'
+```
+
+### Combo Examples
+
+```bash
+# Maximum evasion (Root)
+-u 'sni://proxy:443?L3R:fake=3,L3R:split=3?'
+
+# Medium evasion (No Root)
+-u 'sni://proxy:443?L3R:oob=41,L3R:split=5?'
+
+# Full stack — all layers (Root)
+-u 'sni://proxy:443?L3R:fake=4,L3R:rst=3,L3R:split=3,L3:ttl=8,L3:tos=0x10,0-0=17?'
+
+# Anti-censorship Tor (Root)
+./sockslender \
+  -l sni://0.0.0.0:443 \
+  -u 'sni://127.0.0.1:9050?L3R:fake=3,L3R:split=3?' \
+  '-rrr?tor --SocksPort 9050,127.0.0.1:9050?'
+```
+
+### Processing Order
+
+```
+connect_chain():
+  1. TCP handshake
+  2. apply_l3() → setsockopt (TTL, TOS, MARK, BIND...)
+
+First data packet:
+  3. L3R:fake    → raw socket: garbage with low TTL
+  4. L3R:rst     → raw socket: fake RST with low TTL
+  5. L3R:oob     → TCP urgent byte
+  6. L3R:split   → first half, 1ms delay, second half
+     OR L3R:disorder → second half raw, first half normal
+     OR L3R:seg   → N-byte chunks with 1ms gaps
+
+Subsequent packets:
+  7. Normal relay with L7 scripts (offset, aob, if/el)
 ```
 
 ---
@@ -448,60 +556,27 @@ Use `-v` to see all packet modifications:
 
 ### Simple Background Task (`-r`)
 
-Launch a command when SockSlender starts. Killed on exit.
-
 ```bash
--r?COMMAND?
-
-# Examples:
 -r?tor --SocksPort 9050?
--r?ssh -D 1080 user@server?
--r?openvpn --config vpn.conf?
-
-# Multiple commands:
 -r?tor --SocksPort 9050, sslocal -c ss.json?
 ```
 
 ### Auto-Restart Watchdog (`-rr`)
 
-Launch + monitor + auto-restart on crash or freeze.
-
 ```bash
--rr?COMMAND,ENDPOINT?
-
-# Monitor tor via SOCKS5 handshake
 -rr?tor --SocksPort 9050,socks5://127.0.0.1:9050?
-
-# Monitor SSH tunnel via TCP check
 -rr?ssh -D 1080 user@server,127.0.0.1:1080?
-
-# Monitor HTTP proxy
--rr?squid,http://127.0.0.1:3128?
 ```
 
 **Watchdog behavior:**
 - Checks every 15 seconds
 - Exponential backoff: 30s → 60s → 120s → 240s → 300s (max)
-- Distinguishes CRASH (process dead) vs FREEZE (alive but not responding)
-- Resets backoff counter when service recovers
+- Distinguishes CRASH vs FREEZE
+- Resets backoff when service recovers
 
-```
-[!] [Watchdog] CRASH DETECTED: "tor" is dead (restart #1)
-    -> Restarted (PID: 12345). Next check in 60s.
+### ProxyChains Tunnel (`-rrr`) — Linux/Android
 
-[!] [Watchdog] FREEZE DETECTED: "tor" alive but SOCKS5 handshake failed (restart #2)
-    -> Restarted (PID: 12346). Next check in 120s.
-```
-
-### ProxyChains Tunnel (`-rrr`) — Linux/Android Only
-
-Launch a command tunneled through the chain nodes **before** its endpoint.
-
-```bash
--rrr?COMMAND,ENDPOINT_IN_CHAIN?
-```
-
-**Example:**
+Tunnel a command through chain nodes **before** its endpoint:
 
 ```bash
 ./sockslender \
@@ -510,37 +585,34 @@ Launch a command tunneled through the chain nodes **before** its endpoint.
   '-rrr?tor --SocksPort 9050,127.0.0.1:9050?'
 ```
 
-**What happens:**
-
 ```
-1. SockSlender finds 127.0.0.1:9050 in the chain
-2. Extracts nodes BEFORE it: [proxy1:1010, proxy2:2020]
-3. Generates proxychains config file
-4. Launches: proxychains4 -q -f config.conf tor --SocksPort 9050
-5. Tor's traffic is tunneled through proxy1 → proxy2
-6. Full chain: client → proxy1 → proxy2 → tor → exit
-
-Auto-generated config (sockslender_pc_1_0.conf):
-┌──────────────────────────────────┐
-│ strict_chain                           │
-│ quiet_mode                       	  │
-│ proxy_dns                              │
-│ tcp_read_time_out 15000                │
-│ tcp_connect_time_out 8000              │
-│                                        │
-│ [ProxyList]                            │
-│ socks5  127.0.0.1  1010                │
-│ socks5  127.0.0.1  2020                │
-└──────────────────────────────────┘
+Result: tor tunneled via proxy1 → proxy2 → internet
+  tor ──proxychains4──→ proxy1:1010 → proxy2:2020 → internet
+  Full chain: client → proxy1 → proxy2 → tor → exit:3030
 ```
 
-> **Requires:** `proxychains4` installed (`apt install proxychains4`)
+### Supported via Process Manager
+
+```
+VMess/VLESS:    -rr?v2ray,127.0.0.1:10808?
+Trojan:         -rr?trojan-go,127.0.0.1:1080?
+Shadowsocks:    -rrr?ss-local,127.0.0.1:1089?
+WireGuard:      -r?wg-quick up wg0?
+OpenVPN:        -rr?openvpn --config x.ovpn,sni://...?
+SSH Tunnel:     -rr?ssh -D 1080 user@host,127.0.0.1:1080?
+Tor:            -rrr?tor --SocksPort 9050,127.0.0.1:9050?
+Hysteria:       -rr?hysteria client,127.0.0.1:1080?
+NaiveProxy:     -rr?naive --listen=...,127.0.0.1:...?
+MTProto:        -rr?mtg run ...,127.0.0.1:443?
+```
+
+**= Any CLI tool with a listening port can be managed by SockSlender.**
 
 ---
 
-## Multi-Box Architecture
+## 📦 Multi-Box Architecture
 
-Run completely independent proxy instances in a single process using `::`:
+Run independent proxy instances in a single process:
 
 ```bash
 ./sockslender \
@@ -551,92 +623,55 @@ Run completely independent proxy instances in a single process using `::`:
   -l dns://0.0.0.0:5353 -u dns://8.8.8.8:53
 ```
 
-```
-┌─── Box 1 ──────────────────────┐
-│ SOCKS5 :1080 → proxy-a:1010.       │
-└───────────────────────────────┘
-┌─── Box 2 ──────────────────────┐
-│ HTTP   :8080 → proxy-b:2020        │
-└───────────────────────────────┘
-┌─── Box 3 ──────────────────────┐
-│ DNS    :5353 → 8.8.8.8:53          │
-└───────────────────────────────┘
-```
-
-Each Box has:
-- Independent listeners
-- Independent chain pools
-- Independent health checking
-- Independent chain scoring
+Each Box has independent listeners, chains, health checking, and scoring.
 
 ---
 
 ## Advanced Examples
 
-### Full-Featured Setup
+### Full Anti-Censorship Setup
 
 ```bash
 ./sockslender \
   -v \
-  -r?tor --SocksPort 9050? \
-  -rr?ssh -D 1080 user@server,127.0.0.1:1080? \
   -l socks5://admin:pass@0.0.0.0:1080 \
-  -l http://admin:pass@0.0.0.0:8080 \
+  -l sni://0.0.0.0:443 \
   -l dns://0.0.0.0:53 \
-  -u socks5://server1:1010 \
-  -u socks5://server2:2020 \
+  -u 'sni://server1:443?L3R:fake=3,L3R:split=3,L3:nodelay=1?' \
+  -u 'sni://server2:443?L3R:fake=4,L3R:split=5?' \
   -u dns://8.8.8.8:53 \
   -u dns://1.1.1.1:53
 ```
 
-### Chain with Tor Tunnel
+### Tor over Proxychains with DPI Desync
 
 ```bash
 ./sockslender \
   -l socks5://0.0.0.0:1080 \
-  -u 'socks5://entry:1010+socks5://127.0.0.1:9050+socks5://exit:3030' \
+  -u 'socks5://entry:1010+socks5://127.0.0.1:9050?L3R:fake=3?' \
   '-rrr?tor --SocksPort 9050,127.0.0.1:9050?'
 ```
 
-### Macro-Based Multi-Path Routing
+### Multi-Path with Macros
+
+```bash
+./sockslender \
+  -i 'socks5://us:1010+socks5://us2:2020+-xUS' \
+  -i 'socks5://eu:3030+socks5://eu2:4040+-xEU' \
+  -u US+socks5://final-us:9090 \
+  -u EU+socks5://final-eu:9090 \
+  -i US+-xsocks5://0.0.0.0:2080 \
+  -i EU+-xsocks5://0.0.0.0:3080 \
+  -l socks5://0.0.0.0:1080
+```
+
+### V2Ray + Chain + Script Fix
 
 ```bash
 ./sockslender \
   -l socks5://0.0.0.0:1080 \
-  -i 'socks5://us-east:1010+socks5://us-west:2020+-xUS_PATH' \
-  -i 'socks5://eu-north:3030+socks5://eu-south:4040+-xEU_PATH' \
-  -u US_PATH+socks5://final-us:9090 \
-  -u EU_PATH+socks5://final-eu:9090 \
-  -i US_PATH+-xsocks5://0.0.0.0:2080 \
-  -i EU_PATH+-xsocks5://0.0.0.0:3080
-```
-
-Result:
-```
-:1080 → best of [us-east→us-west→final-us, eu-north→eu-south→final-eu]
-:2080 → us-east → us-west (US only)
-:3080 → eu-north → eu-south (EU only)
-```
-
-### SNI Proxy with Packet Modification
-
-```bash
-./sockslender \
-  -l sni://0.0.0.0:443 \
-  -u 'sni://backend:443?1603__01 if 2-2=03?'
-```
-
-### Isolated DNS + SOCKS5 Boxes
-
-```bash
-./sockslender \
-  -l socks5://0.0.0.0:1080 \
-  -u socks5://proxy:1234 \
-  :: \
-  -l dns://0.0.0.0:53 \
-  -u dns://8.8.8.8:53 \
-  -u dns://8.8.4.4:53 \
-  -u dns://1.1.1.1:53
+  -u 'socks5://entry:1010+socks5://127.0.0.1:10808?1-1=00 if 1-1=01?' \
+  -rr?v2ray run -c config.json,socks5://127.0.0.1:10808?
 ```
 
 ---
@@ -645,86 +680,50 @@ Result:
 
 ### Linux / Android
 
-- **FD Limits:** Automatically raised on startup (soft → hard, up to 65536)
-- **`-rrr`:** Fully supported (requires `proxychains4`)
-- **Recommended:** `apt install proxychains4` for `-rrr` feature
+- **FD Limits:** Automatically raised on startup
+- **L3 Socket Options:** Fully supported
+- **L3R DPI Desync:** Fully supported (root for fake/rst/disorder)
+- **`-rrr`:** Supported (requires `proxychains4`)
 
 ### macOS
 
-- **FD Limits:** Automatically raised on startup
-- **`-rrr`:** Supported (install via `brew install proxychains-ng`)
+- **FD Limits:** Automatically raised
+- **L3 Socket Options:** Partially supported (no MARK/BIND)
+- **L3R DPI Desync:** split/seg/oob work, raw socket limited
+- **`-rrr`:** Supported via `proxychains-ng`
 
 ### Windows
 
-- **FD Limits:** Not applicable (Windows uses handles)
-- **`-rrr`:** Not available (proxychains is Linux/macOS only)
+- **FD Limits:** N/A
+- **L3/L3R:** Not available
+- **L7 Script Engine:** Fully supported
 - **All other features:** Fully supported
+- **`-rrr`:** Not available
 
 ---
 
-## Startup Output Example
+### Script Engine Layer Stack
 
 ```
-[*] FD limits: soft=1024, hard=1048576
-[*] FD soft limit raised: 1024 -> 65536
-[*] FD limit OK: 65536
-[*] [Box 1] -rrr: "tor --SocksPort 9050" tunneled via:
-    socks5://127.0.0.1:1010 -> socks5://127.0.0.1:2020 -> 127.0.0.1:9050
-    PID: 54321 | proxychains: /usr/bin/proxychains4 | config: sockslender_pc_1_0.conf
-[*] [Box 1] Parsed successfully. 3 listener(s), 4 routing chain(s).
-    -> VERBOSE mode enabled for this Box.
-[*] Starting 1 independent Box(es)...
-[+] [Box 1] SOCKS5 on 0.0.0.0:1080 (TCP)
-[+] [Box 1] HTTP on 0.0.0.0:8080 (TCP)
-[+] [Box 1] DNS on 0.0.0.0:53 (UDP)
-```
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                      SockSlender                                    │
-│                                                                     │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐         │
-│  │ SOCKS5    │  │  HTTP    │  │   SNI     │  │   DNS     │        │
-│  │Listener   │  │Listener  │  │Listener   │  │Listener   │        │
-│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘         │
-│       │              │              │              │               │
-│       └────────────┴─────┬──────┴────────────┘              │
-│                          │                                         │
-│                 ┌────────▼────────┐                            │
-│                 │  Chain Selector     │                            │
-│                 │  (Score-based)      │                            │
-│                 └────────┬────────┘                             │
-│                            │                                       │
-│          ┌──────────────┼───────────────┐                    │
-│          │                 │                 │                    │
-│   ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐        │
-│   │  Chain A       │ │  Chain B       │ │  Chain C       │        │
-│   │ Score: 17.0    │ │ Score: 4.6     │ │ Score: 0.01    │        │
-│   │  ★ Best       │ │  Fallback      │ │  Disabled      │         │
-│   └──────┬──────┘ └──────┬──────┘  └─────────────┘         │
-│           │                  │                                     │
-│     ┌────▼────┐     ┌────▼────┐                               │
-│     │ Node 1    │     │ Node 1    │                               │
-│     │ Node 2    │     │ Node 2    │                               │
-│     │ Node 3    │     └─────────┘                               │
-│     └─────────┘                                                  │
-│                                                                    │
-│  ┌──────────────┐  ┌──────────────┐                          │
-│  │Health Checker   │  │  Watchdog      │                          │
-│  │  (20s loop)     │  │ (15s loop)     │                          │
-│  └──────────────┘  └──────────────┘                          │
-└──────────────────────────────────────────────────────────┘
+Processing order per connection:
+─────────────────────────────────────
+1. TCP connect
+2. L2: SO_BINDTODEVICE         (which NIC)
+3. L3: setsockopt TTL/TOS/MARK (IP header behavior)
+4. L4: setsockopt NODELAY/KEEPALIVE (TCP behavior)
+5. Protocol handshake (SOCKS5/HTTP)
+6. First packet:
+   a. L3R: fake/rst via raw socket
+   b. L3R: split/disorder/seg/oob
+7. L7: byte patch, AOB scan    (every packet)
+8. Relay
 ```
 
 ---
 
 ## License
 
-MIT - use it however you want.
+MIT License — use it however you want.
 
 ---
 
