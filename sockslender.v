@@ -1067,6 +1067,45 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					}
 				}
 			}
+			'badcsum' {
+				$if !windows {
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok {
+						if verbose {
+							println('  [L3R] BADCSUM skipped: TCP_REPAIR failed')
+						}
+						continue
+					}
+					fake_payload := gen_fake_payload(data.len, 15)
+					mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 64, fake_payload)
+					pkt[36] = ~pkt[36]
+					pkt[37] = ~pkt[37]
+					
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  [L3R] BADCSUM sent ${if ok { 'OK' } else { 'FAIL' }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'faketeardown' {
+				$if !windows {
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok { continue }
+					
+					mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x11, 64, []u8{})
+					pkt[36] = ~pkt[36]
+					pkt[37] = ~pkt[37]
+					
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  [L3R] FAKE TEARDOWN (FIN) sent ${if ok { 'OK' } else { 'FAIL' }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
 			else {}
 		}
 	}
@@ -1571,7 +1610,6 @@ fn main() {
 	}
 }
 
-@[inline]
 fn apply_action(mut buf []u8, nr int, start int, hx []u8) {
 	for i in 0 .. hx.len {
 		if start + i < nr {
@@ -1580,7 +1618,6 @@ fn apply_action(mut buf []u8, nr int, start int, hx []u8) {
 	}
 }
 
-@[inline]
 fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 	for rule in script {
 		if rule.mode == 'l3' || rule.mode == 'l3r' {
@@ -1641,7 +1678,6 @@ fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 	}
 }
 
-@[inline]
 fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule, verbose bool) {
 	mut b := []u8{len: buf_size}
 	mut is_first := has_l3r_rules(script)
@@ -1672,7 +1708,6 @@ fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule
 	done <- true
 }
 
-@[inline]
 fn do_relay(mut a net.TcpConn, mut b net.TcpConn, script []Rule, verbose bool) {
 	a.set_read_timeout(5 * time.minute)
 	b.set_read_timeout(5 * time.minute)
@@ -1685,7 +1720,6 @@ fn do_relay(mut a net.TcpConn, mut b net.TcpConn, script []Rule, verbose bool) {
 	_ = <-done
 }
 
-@[inline]
 fn start_listener(mut app App, li int) {
 	l := app.listeners[li]
 	pname := match l.proto {
@@ -1714,7 +1748,6 @@ fn start_listener(mut app App, li int) {
 	}
 }
 
-@[inline]
 fn handle_conn(mut app App, mut client net.TcpConn, li int) {
 	l := app.listeners[li]
 	match l.proto {
@@ -1808,7 +1841,6 @@ fn health_checker(mut app App) {
 	}
 }
 
-@[inline]
 fn check_chain(c Chain) bool {
 	if c.nodes.len == 0 {
 		return false
@@ -1822,7 +1854,6 @@ fn check_chain(c Chain) bool {
 	}
 }
 
-@[inline]
 fn check_tcp_h(addr string) bool {
 	mut c := net.dial_tcp(addr) or { return false }
 	c.close() or {}
@@ -1897,7 +1928,6 @@ fn check_http_h(n Node) bool {
 	return buf[..nr].bytestr().contains('200')
 }
 
-@[inline]
 fn pick_chain_order(mut app App) []int {
 	app.mu.@lock()
 	defer {
@@ -1939,7 +1969,6 @@ fn pick_chain_order(mut app App) []int {
 	return idxs
 }
 
-@[inline]
 fn pick_best_from_list(mut app App, allowed_idxs []int) []int {
 	app.mu.@lock()
 	defer {
@@ -2032,29 +2061,31 @@ fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpCon
 	return conn
 }
 
-@[inline]
 fn do_socks5_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	if n.user != '' {
 		c.write([u8(0x05), 0x01, 0x02])!
 	} else {
 		c.write([u8(0x05), 0x01, 0x00])!
 	}
+
 	mut gr := []u8{len: 2}
 	read_full(mut c, mut gr, 2)!
 	if gr[0] != 0x05 {
 		return error('not socks5')
 	}
+
 	if n.user != '' {
 		if gr[1] != 0x02 {
 			return error('auth rejected')
 		}
 		mut a := []u8{cap: 3 + n.user.len + n.pass.len}
-		a << 0x01
+		a << u8(0x01)
 		a << u8(n.user.len)
 		a << n.user.bytes()
 		a << u8(n.pass.len)
 		a << n.pass.bytes()
 		c.write(a)!
+
 		mut ar := []u8{len: 2}
 		read_full(mut c, mut ar, 2)!
 		if ar[1] != 0x00 {
@@ -2063,6 +2094,11 @@ fn do_socks5_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	} else if gr[1] != 0x00 {
 		return error('noauth rejected')
 	}
+
+	if host.len > 255 {
+		return error('host too long')
+	}
+
 	mut req := []u8{cap: 7 + host.len}
 	req << u8(0x05)
 	req << u8(0x01)
@@ -2070,32 +2106,42 @@ fn do_socks5_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	req << u8(0x03)
 	req << u8(host.len)
 	req << host.bytes()
-	req << u8(port >> 8)
+	req << u8((port >> 8) & 0xff)
 	req << u8(port & 0xff)
 	c.write(req)!
-	mut resp := []u8{len: 263}
-	mut rn := read_full(mut c, mut resp, 4)!
-	if resp[1] != 0x00 {
+
+	mut hdr := []u8{len: 4}
+	read_full(mut c, mut hdr, 4)!
+
+	if hdr[0] != 0x05 {
+		return error('bad version')
+	}
+	if hdr[1] != 0x00 {
 		return error('connect fail')
 	}
-	mut total := 0
-	match resp[3] {
-		0x01 { total = 10 }
-		0x04 { total = 22 }
-		0x03 {
-			if rn < 5 {
-				rn = read_full(mut c, mut resp, 5)!
-			}
-			total = 7 + int(resp[4])
+
+	match hdr[3] {
+		0x01 {
+			mut rest := []u8{len: 6} // ipv4(4) + port(2)
+			read_full(mut c, mut rest, 6)!
 		}
-		else { return error('bad atyp') }
-	}
-	if rn < total {
-		read_full(mut c, mut resp, total)!
+		0x04 {
+			mut rest := []u8{len: 18} // ipv6(16) + port(2)
+			read_full(mut c, mut rest, 18)!
+		}
+		0x03 {
+			mut lb := []u8{len: 1}
+			read_full(mut c, mut lb, 1)!
+			ln := int(lb[0])
+			mut rest := []u8{len: ln + 2} // domain + port
+			read_full(mut c, mut rest, ln + 2)!
+		}
+		else {
+			return error('bad atyp')
+		}
 	}
 }
 
-@[inline]
 fn do_http_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	tgt := '${host}:${port}'
 	mut req := 'CONNECT ${tgt} HTTP/1.1\r\nHost: ${tgt}\r\n'
@@ -2104,6 +2150,7 @@ fn do_http_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 	}
 	req += '\r\n'
 	c.write(req.bytes())!
+
 	mut buf := []u8{len: 4096}
 	mut acc := []u8{}
 	for {
@@ -2112,15 +2159,16 @@ fn do_http_hs(mut c net.TcpConn, n Node, host string, port int) ! {
 			return error('closed')
 		}
 		acc << buf[..nr]
-		if acc.bytestr().contains('\r\n\r\n') {
-			break
-		}
 		if acc.len > 8192 {
 			return error('resp too large')
 		}
-	}
-	if !acc.bytestr().contains('200') {
-		return error('CONNECT rejected')
+		resp_s := acc.bytestr()
+		if resp_s.contains('\r\n\r\n') {
+			if !resp_s.starts_with('HTTP/1.1 200') && !resp_s.starts_with('HTTP/1.0 200') {
+				return error('CONNECT rejected')
+			}
+			break
+		}
 	}
 }
 
@@ -2392,7 +2440,6 @@ fn handle_sni(mut app App, mut client net.TcpConn, l Listener) {
 	do_relay(mut client, mut upstream, []Rule{}, app.verbose)
 }
 
-@[inline]
 fn extract_sni(d []u8) string {
 	if d.len < 44 || d[0] != 0x16 || d[5] != 0x01 {
 		return ''
@@ -2430,7 +2477,6 @@ fn extract_sni(d []u8) string {
 	return ''
 }
 
-@[inline]
 fn read_full(mut c net.TcpConn, mut buf []u8, min int) !int {
 	if min > buf.len {
 		return error('min exceeds buffer')
