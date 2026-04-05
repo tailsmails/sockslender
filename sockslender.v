@@ -1535,7 +1535,7 @@ fn main() {
 								}
 							}
 						} else {
-							node := parse_uri(name) or { exit(1) }
+							node := parse_uri(name) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
 							mut new_chain_idxs := []int{}
 							for path in current_paths {
 								if path.len > 0 {
@@ -1590,7 +1590,7 @@ fn main() {
 								exit(1)
 							}
 						} else {
-							node := parse_uri(part) or { exit(1) }
+							node := parse_uri(part) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
 							for mut path in current_paths {
 								path << node
 							}
@@ -1643,7 +1643,7 @@ fn main() {
 						exit(1)
 					}
 				} else {
-					node := parse_uri(part) or { exit(1) }
+					node := parse_uri(part) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
 					for mut path in out_paths {
 						path << node
 					}
@@ -1676,7 +1676,7 @@ fn main() {
 					mut prior := find_prior_nodes(chains, ep_addr)
 					if prior.len == 0 {
 						for proto_prefix in ['socks5://', 'http://'] {
-							ep_node := parse_uri(proto_prefix + rrr_endpoint) or { continue }
+							ep_node := parse_uri(proto_prefix + rrr_endpoint) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
 							prior = find_prior_nodes(chains, ep_node.addr)
 							if prior.len > 0 {
 								break
@@ -2017,13 +2017,23 @@ fn check_chain(c Chain) bool {
 	if c.nodes.len == 0 {
 		return false
 	}
-	n := c.nodes[0]
-	match n.proto {
-		.socks5 { return check_socks5_h(n) }
-		.http { return check_http_h(n) }
-		.sni { return check_tcp_h(n.addr) }
-		.dns { return check_dns_h(n) }
+	
+	if c.nodes.len == 1 {
+		n := c.nodes[0]
+		match n.proto {
+			.socks5 { return check_socks5_h(n) }
+			.http { return check_http_h(n) }
+			.sni { return check_tcp_h(n.addr) }
+			.dns { return check_dns_h(n) }
+		}
 	}
+	
+	mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false) or {
+		return false
+	}
+	
+	conn.close() or {}
+	return true
 }
 
 fn check_tcp_h(addr string) bool {
@@ -2210,19 +2220,62 @@ fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpCon
 	if chain.len == 0 {
 		return error('empty chain')
 	}
-	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial failed') }
+	
+	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial failed to first node') }
 	if chain[0].script.len > 0 {
 		apply_l3(conn.sock.handle, chain[0].script, verbose)
 	}
-	match chain[0].proto {
+	
+	for i := 1; i < chain.len; i++ {
+		prev_node := chain[i - 1]
+		next_node := chain[i]
+		
+		next_host, next_port_str := parse_host_port(next_node.addr)
+		next_port := next_port_str.int()
+		if next_port == 0 {
+			conn.close() or {}
+			return error('invalid port in chain node: ${next_node.addr}')
+		}
+
+		if verbose {
+			println('  [Chain] Tunneling through ${prev_node.addr} to reach ${next_node.addr}...')
+		}
+		
+		match prev_node.proto {
+			.socks5 {
+				do_socks5_hs(mut conn, prev_node, next_host, next_port) or {
+					conn.close() or {}
+					return error('chain broken at ${prev_node.addr} -> ${next_node.addr}')
+				}
+			}
+			.http {
+				do_http_hs(mut conn, prev_node, next_host, next_port) or {
+					conn.close() or {}
+					return error('chain broken at ${prev_node.addr} -> ${next_node.addr}')
+				}
+			}
+			else {
+				conn.close() or {}
+				return error('unsupported protocol for chaining at ${prev_node.addr}')
+			}
+		}
+	}
+	
+	last_node := chain.last()
+	
+	if verbose {
+		println('  [Chain] Final node ${last_node.addr} connecting to target ${host}:${port}...')
+	}
+
+	match last_node.proto {
 		.socks5 {
-			do_socks5_hs(mut conn, chain[0], host, port) or {
+			do_socks5_hs(mut conn, last_node, host, port) or {
 				conn.close() or {}
 				return err
 			}
 		}
 		.http {
-			do_http_hs(mut conn, chain[0], host, port) or {
+			do_http_hs(mut conn, last_node, host, port) or {
 				conn.close() or {}
 				return err
 			}
@@ -2230,6 +2283,7 @@ fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpCon
 		.sni {}
 		.dns {}
 	}
+
 	return conn
 }
 
