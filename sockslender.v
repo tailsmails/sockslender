@@ -21,7 +21,7 @@ fn C.getrlimit(int, &C.rlimit) int
 fn C.setrlimit(int, &C.rlimit) int
 fn C.socket(int, int, int) int
 
-const check_interval = 20 * time.second
+const check_interval = 10 * time.second
 const check_timeout = 5 * time.second
 const buf_size = 65536
 
@@ -2906,8 +2906,8 @@ fn watchdog_loop(mut wd Watchdog) {
 			mut next_cd := i64(30)
 			for _ in 0 .. new_rc {
 				next_cd *= 2
-				if next_cd > 300 {
-					next_cd = 300
+				if next_cd > 120 {
+					next_cd = 120
 					break
 				}
 			}
