@@ -24,6 +24,7 @@ fn C.socket(int, int, int) int
 const check_interval = 10 * time.second
 const check_timeout = 5 * time.second
 const buf_size = 65536
+const dns_sma_lim = 512
 
 struct ManagedProcess {
 	cmd        string
@@ -113,6 +114,7 @@ mut:
 	udp_port   u32
 	mu         sync.Mutex
 	verbose    bool
+	dns_sma    u32
 }
 
 fn check_fd_limits() {
@@ -600,6 +602,13 @@ fn apply_l3(fd int, rules []Rule, verbose bool) {
 					res := C.setsockopt(fd, 6, 1, &val, u32(4))
 					if verbose {
 						println('  [L3] NODELAY=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+					}
+				}
+				'delay' {
+					val := parse_int_or_hex(rule.l3_val)
+					time.sleep(val * time.millisecond)
+					if verbose {
+						println('  [G] DELAY=${val} OK')
 					}
 				}
 				else {
@@ -1755,6 +1764,7 @@ fn main() {
 			rr_counter: 0
 			udp_port: u32(40000 + (box_idx * 1000))
 			verbose: verbose
+			dns_sma: u32(0)
 		}
 		apps << app
 		println('[*] [Box ${app.id}] Parsed successfully. ${listeners.len} listener(s), ${chains.len} routing chain(s).')
@@ -1905,7 +1915,7 @@ fn start_listener(mut app App, li int) {
 		println('[+] [Box ${app.id}] ${pname} on ${l.addr} (UDP)')
 		for {
 			mut buf := []u8{len: 2048}
-			n, addr := listener.read(mut buf) or { continue }
+			mut n, mut addr := listener.read(mut buf) or { continue }
 			if n > 0 {
 				spawn handle_dns_request(mut app, mut listener, addr, buf[..n].clone(), l)
 			}
@@ -1934,6 +1944,10 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 	if req.len < 12 {
 		return
 	}
+	if app.dns_sma > dns_sma_lim {
+		//println("[*] dns_sma is reached the limit")
+		return
+	}
 	mut order := if l.is_global {
 		pick_chain_order(mut app)
 	} else {
@@ -1954,13 +1968,23 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 			continue
 		}
 		mut out_conn := net.listen_udp('0.0.0.0:0') or { continue }
-		out_conn.set_read_timeout(500 * time.millisecond)
+		out_conn.set_read_timeout(100)
+		if app.dns_sma > dns_sma_lim { return }
+		defer {
+			out_conn.close() or {}
+			app.dns_sma--
+		}
+		app.dns_sma++
+		if app.dns_sma > dns_sma_lim {
+			//out_conn.close() or {}
+			return
+		}
 		if nodes[0].script.len > 0 {
 			apply_l3(out_conn.sock.handle, nodes[0].script, app.verbose)
 		}
 		t0 := time.now()
 		out_conn.write_to(up_addrs[0], req) or {
-			out_conn.close() or {}
+			//out_conn.close() or {}
 			app.mu.@lock()
 			record_failure(mut app.chains[ci])
 			app.mu.unlock()
@@ -1968,7 +1992,7 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 		}
 		mut resp_buf := []u8{len: 2048}
 		rn, _ := out_conn.read(mut resp_buf) or {
-			out_conn.close() or {}
+			//out_conn.close() or {}
 			app.mu.@lock()
 			record_failure(mut app.chains[ci])
 			app.mu.unlock()
@@ -1980,10 +2004,9 @@ fn handle_dns_request(mut app App, mut listener net.UdpConn, client_addr net.Add
 			record_success(mut app.chains[ci], lat)
 			app.mu.unlock()
 			listener.write_to(client_addr, resp_buf[..rn]) or {}
-			out_conn.close() or {}
+			//out_conn.close() or {}
 			return
 		}
-		out_conn.close() or {}
 	}
 }
 
