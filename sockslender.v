@@ -26,6 +26,247 @@ const check_timeout = 5 * time.second
 const buf_size = 65536
 const dns_sma_lim = 512
 
+struct SocketMonitor {
+mut:
+	active_count u32
+	peak_count u32
+	total_opened u64
+	total_closed u64
+	mu sync.Mutex
+	max_allowed u32 = 1000
+	warning_threshold u32 = 800
+	last_warning time.Time
+}
+
+@[heap]
+struct ManagedConnection {
+mut:
+	conn &net.TcpConn
+	created_at time.Time
+	last_activity time.Time
+	purpose string // 'client', 'upstream', 'relay'
+	closed bool
+}
+
+fn (mut mon SocketMonitor) can_open() bool {
+	mon.mu.@lock()
+	defer { mon.mu.unlock() }
+	
+	if mon.active_count >= mon.max_allowed {
+		return false
+	}
+	
+	if mon.active_count >= mon.warning_threshold {
+		now := time.now()
+		if now - mon.last_warning > 5 * time.second {
+			mon.last_warning = now
+			eprintln('[!] Socket warning: ${mon.active_count}/${mon.max_allowed} active')
+		}
+	}
+	
+	return true
+}
+
+fn (mut mon SocketMonitor) register_open() bool {
+	mon.mu.@lock()
+	defer { mon.mu.unlock() }
+	
+	if mon.active_count >= mon.max_allowed {
+		return false
+	}
+	
+	mon.active_count++
+	mon.total_opened++
+	
+	if mon.active_count > mon.peak_count {
+		mon.peak_count = mon.active_count
+	}
+	
+	return true
+}
+
+fn (mut mon SocketMonitor) register_close() {
+	mon.mu.@lock()
+	defer { mon.mu.unlock() }
+	
+	if mon.active_count > 0 {
+		mon.active_count--
+	}
+	mon.total_closed++
+}
+
+fn (mut mon SocketMonitor) get_stats() (u32, u32, u64, u64) {
+	mon.mu.@lock()
+	defer { mon.mu.unlock() }
+	return mon.active_count, mon.peak_count, mon.total_opened, mon.total_closed
+}
+
+fn (mut app App) register_connection(mut conn net.TcpConn, purpose string) bool {
+	if !app.sock_mon.can_open() {
+		if app.verbose {
+			eprintln('[!] Socket limit reached, rejecting connection')
+		}
+		conn.close() or {}
+		return false
+	}
+	
+	if !app.sock_mon.register_open() {
+		conn.close() or {}
+		return false
+	}
+	
+	handle := conn.sock.handle
+	
+	app.mu.@lock()
+	app.active_conns[handle] = &ManagedConnection{
+		conn: conn
+		created_at: time.now()
+		last_activity: time.now()
+		purpose: purpose
+		closed: false
+	}
+	app.mu.unlock()
+	
+	return true
+}
+
+fn (mut app App) unregister_connection(mut conn net.TcpConn) {
+	handle := conn.sock.handle
+	
+	app.mu.@lock()
+	if handle in app.active_conns {
+		managed := app.active_conns[handle] or { 
+			app.mu.unlock()
+			conn.close() or {}
+			return 
+		}
+		
+		if !managed.closed {
+			mut m := unsafe { managed }
+			m.closed = true
+			app.active_conns.delete(handle)
+			app.sock_mon.register_close()
+		}
+	}
+	app.mu.unlock()
+	
+	conn.close() or {}
+}
+
+fn (mut app App) safe_close(mut conn net.TcpConn) {
+	app.unregister_connection(mut conn)
+}
+
+fn socket_janitor(mut app App) {
+	for {
+		time.sleep(30 * time.second)
+		
+		now := time.now()
+		mut to_close := []int{}
+		
+		app.mu.@lock()
+		for handle, managed in app.active_conns {
+			if managed.closed {
+				to_close << handle
+				continue
+			}
+			
+			if now - managed.last_activity > 10 * time.minute {
+				to_close << handle
+				if app.verbose {
+					println('[Janitor] Closing stale connection: ${managed.purpose} (idle ${now - managed.last_activity})')
+				}
+			}
+			
+			if now - managed.created_at > 1 * time.hour {
+				to_close << handle
+				if app.verbose {
+					println('[Janitor] Closing old connection: ${managed.purpose} (age ${now - managed.created_at})')
+				}
+			}
+		}
+		
+		for handle in to_close {
+			if handle in app.active_conns {
+				managed := app.active_conns[handle] or { continue }
+				mut m := unsafe { managed }
+				m.closed = true
+				m.conn.close() or {}
+				app.active_conns.delete(handle)
+				app.sock_mon.register_close()
+			}
+		}
+		app.mu.unlock()
+		
+		if to_close.len > 0 {
+			println('[Janitor] Cleaned ${to_close.len} stale sockets')
+		}
+		
+		active, peak, opened, closed := app.sock_mon.get_stats()
+		if app.verbose || active > 500 {
+			leaked := opened - closed - u64(active)
+			println('[Stats] Active: ${active}, Peak: ${peak}, Opened: ${opened}, Closed: ${closed}, Leaked: ${leaked}')
+		}
+	}
+}
+
+fn (mut app App) emergency_cleanup() {
+	println('[!] EMERGENCY: Force closing old connections')
+	
+	now := time.now()
+	mut closed_count := 0
+	
+	app.mu.@lock()
+	
+	app.req_queue.mu.@lock()
+	mut survivors := []PendingRequest{}
+	for mut req in app.req_queue.queue {
+		if now - req.queued_at > 30 * time.second {
+			req.client.close() or {}
+			closed_count++
+		} else {
+			survivors << req
+		}
+	}
+	app.req_queue.queue = survivors
+	app.req_queue.mu.unlock()
+	
+	for handle, managed in app.active_conns {
+		if now - managed.last_activity > 2 * time.minute {
+			mut m := unsafe { managed }
+			m.conn.close() or {}
+			app.active_conns.delete(handle)
+			app.sock_mon.register_close()
+			closed_count++
+		}
+	}
+	
+	app.mu.unlock()
+	
+	println('[!] Emergency cleanup: ${closed_count} connections force-closed')
+}
+
+fn emergency_monitor(mut app App) {
+	for {
+		time.sleep(10 * time.second)
+		
+		active, _, _, _ := app.sock_mon.get_stats()
+		
+		if active >= app.sock_mon.max_allowed * 9 / 10 {
+			println('[!] Socket usage critical: ${active}/${app.sock_mon.max_allowed}')
+			app.emergency_cleanup()
+		}
+		
+		app.req_queue.mu.@lock()
+		queue_len := app.req_queue.queue.len
+		app.req_queue.mu.unlock()
+		
+		if queue_len > 500 {
+			println('[!] Queue critical: ${queue_len} pending requests')
+		}
+	}
+}
+
 struct ManagedProcess {
 	cmd        string
 	args       []string
@@ -118,6 +359,8 @@ mut:
 	req_queue  RequestQueue
 	freeze_mode bool
 	hedge_delay time.Duration
+	sock_mon   SocketMonitor
+	active_conns map[int]&ManagedConnection
 }
 
 struct HedgeResult {
@@ -139,7 +382,7 @@ fn hedge_connect(mut app App, ci int, host string, port int, result_chan chan He
 	app.mu.unlock()
 	
 	t0 := time.now()
-	conn := connect_chain(nodes, host, port, false) or {
+	mut conn := connect_chain(nodes, host, port, app.verbose, mut app) or {
 		app.mu.@lock()
 		record_failure(mut app.chains[ci])
 		app.mu.unlock()
@@ -178,7 +421,7 @@ struct RequestQueue {
 mut:
 	queue []PendingRequest
 	mu sync.Mutex
-	max_size int = 5000
+	max_size int = 1000
 	max_wait time.Duration = 60 * time.second
 }
 
@@ -1857,15 +2100,23 @@ fn main() {
 	println('[*] Starting ${apps.len} independent Box(es)...')
 
 	spawn watchdog_loop(mut wd)
-
+	
 	for mut app in apps {
+		app.sock_mon = SocketMonitor{
+			max_allowed: 1000
+			warning_threshold: 800
+			last_warning: time.now()
+		}
+		
 		app.req_queue = RequestQueue{
-			max_size: 5000
+			max_size: 1000
 			max_wait: 60 * time.second
 		}
 		
 		spawn health_checker(mut app)
 		spawn queue_processor(mut app)
+		spawn socket_janitor(mut app)
+		spawn emergency_monitor(mut app)
 		
 		for li in 0 .. app.listeners.len {
 			spawn start_listener(mut app, li)
@@ -1944,14 +2195,34 @@ fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 	}
 }
 
-fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule, verbose bool) {
+fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule, verbose bool, mut app App) {
 	mut b := []u8{len: buf_size}
 	mut is_first := has_l3r_rules(script)
+	
+	src_handle := src.sock.handle
+	dst_handle := dst.sock.handle
+	
 	for {
 		nr := src.read(mut b) or { break }
 		if nr == 0 {
 			break
 		}
+		
+		app.mu.@lock()
+		if src_handle in app.active_conns {
+			if src_managed := app.active_conns[src_handle] {
+				mut sm := unsafe { src_managed }
+				sm.last_activity = time.now()
+			}
+		}
+		if dst_handle in app.active_conns {
+			if dst_managed := app.active_conns[dst_handle] {
+				mut dm := unsafe { dst_managed }
+				dm.last_activity = time.now()
+			}
+		}
+		app.mu.unlock()
+		
 		if verbose {
 			println('\n[-] Traffic In (${nr} bytes): ${hex.encode(b[..nr])}')
 		}
@@ -1974,15 +2245,15 @@ fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule
 	done <- true
 }
 
-fn do_relay(mut a net.TcpConn, mut b net.TcpConn, script []Rule, verbose bool) {
+fn do_relay(mut a net.TcpConn, mut b net.TcpConn, script []Rule, verbose bool, mut app App) {
 	a.set_read_timeout(5 * time.minute)
 	b.set_read_timeout(5 * time.minute)
 	done := chan bool{cap: 2}
-	spawn relay(mut a, mut b, done, script, verbose)
-	spawn relay(mut b, mut a, done, []Rule{}, false)
+	spawn relay(mut a, mut b, done, script, verbose, mut app)
+	spawn relay(mut b, mut a, done, []Rule{}, false, mut app)
 	_ = <-done
-	a.close() or {}
-	b.close() or {}
+	app.safe_close(mut a)
+	app.safe_close(mut b)
 	_ = <-done
 }
 
@@ -2015,6 +2286,14 @@ fn start_listener(mut app App, li int) {
 }
 
 fn handle_conn(mut app App, mut client net.TcpConn, li int) {
+	if !app.register_connection(mut client, 'client') {
+		return
+	}
+	
+	defer {
+		app.safe_close(mut client)
+	}
+	
 	l := app.listeners[li]
 	match l.proto {
 		.socks5 { handle_socks5(mut app, mut client, l) }
@@ -2098,7 +2377,7 @@ fn health_checker(mut app App) {
 	for {
 		for ci in 0 .. app.chains.len {
 			t0 := time.now()
-			alive := check_chain(app.chains[ci])
+			alive := check_chain(app.chains[ci], mut app)
 			d := time.now() - t0
 			lat_us := i64(d) / 1000
 			app.mu.@lock()
@@ -2120,7 +2399,7 @@ fn health_checker(mut app App) {
 	}
 }
 
-fn check_chain(c Chain) bool {
+fn check_chain(c Chain, mut app App) bool {
 	if c.nodes.len == 0 {
 		return false
 	}
@@ -2135,11 +2414,11 @@ fn check_chain(c Chain) bool {
 		}
 	}
 	
-	mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false) or {
+	mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false, mut app) or {
 		return false
 	}
 	
-	conn.close() or {}
+	app.safe_close(mut conn)
 	return true
 }
 
@@ -2308,7 +2587,7 @@ fn connect_retry(mut app App, host string, port int, l Listener) !(&net.TcpConn,
 		nodes := app.chains[ci].nodes.clone()
 		app.mu.unlock()
 		t0 := time.now()
-		conn := connect_chain(nodes, host, port, app.verbose) or {
+		mut conn := connect_chain(nodes, host, port, app.verbose, mut app) or {
 			app.mu.@lock()
 			record_failure(mut app.chains[ci])
 			app.mu.unlock()
@@ -2323,12 +2602,23 @@ fn connect_retry(mut app App, host string, port int, l Listener) !(&net.TcpConn,
 	return error('all chains failed')
 }
 
-fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpConn {
+fn connect_chain(chain []Node, host string, port int, verbose bool, mut app App) !&net.TcpConn {
 	if chain.len == 0 {
 		return error('empty chain')
 	}
 	
-	mut conn := net.dial_tcp(chain[0].addr) or { return error('dial failed to first node') }
+	if !app.sock_mon.can_open() {
+		return error('socket limit reached')
+	}
+	
+	mut conn := net.dial_tcp(chain[0].addr) or { 
+		return error('dial failed to first node') 
+	}
+	
+	if !app.register_connection(mut conn, 'upstream') {
+		return error('socket registration failed')
+	}
+	
 	if chain[0].script.len > 0 {
 		apply_l3(conn.sock.handle, chain[0].script, verbose)
 	}
@@ -2340,7 +2630,7 @@ fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpCon
 		next_host, next_port_str := parse_host_port(next_node.addr)
 		next_port := next_port_str.int()
 		if next_port == 0 {
-			conn.close() or {}
+			app.safe_close(mut conn)
 			return error('invalid port in chain node: ${next_node.addr}')
 		}
 
@@ -2351,18 +2641,18 @@ fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpCon
 		match prev_node.proto {
 			.socks5 {
 				do_socks5_hs(mut conn, prev_node, next_host, next_port) or {
-					conn.close() or {}
+					app.safe_close(mut conn)
 					return error('chain broken at ${prev_node.addr} -> ${next_node.addr}')
 				}
 			}
 			.http {
 				do_http_hs(mut conn, prev_node, next_host, next_port) or {
-					conn.close() or {}
+					app.safe_close(mut conn)
 					return error('chain broken at ${prev_node.addr} -> ${next_node.addr}')
 				}
 			}
 			else {
-				conn.close() or {}
+				app.safe_close(mut conn)
 				return error('unsupported protocol for chaining at ${prev_node.addr}')
 			}
 		}
@@ -2377,13 +2667,13 @@ fn connect_chain(chain []Node, host string, port int, verbose bool) !&net.TcpCon
 	match last_node.proto {
 		.socks5 {
 			do_socks5_hs(mut conn, last_node, host, port) or {
-				conn.close() or {}
+				app.safe_close(mut conn)
 				return err
 			}
 		}
 		.http {
 			do_http_hs(mut conn, last_node, host, port) or {
-				conn.close() or {}
+				app.safe_close(mut conn)
 				return err
 			}
 		}
@@ -2701,7 +2991,7 @@ fn handle_socks5(mut app App, mut client net.TcpConn, l Listener) {
 		client.close() or {}
 		return 
 	}
-	do_relay(mut client, mut upstream, script, app.verbose)
+	do_relay(mut client, mut upstream, script, app.verbose, mut app)
 }
 
 fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
@@ -2777,7 +3067,7 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 			client.close() or {}
 			return 
 		}
-		do_relay(mut client, mut upstream, script, app.verbose)
+		do_relay(mut client, mut upstream, script, app.verbose, mut app)
 	} else {
 		mut rest := parts[1]
 		if rest.starts_with('http://') {
@@ -2832,7 +3122,7 @@ fn handle_http(mut app App, mut client net.TcpConn, l Listener) {
 				return 
 			}
 		}
-		do_relay(mut client, mut upstream, script, app.verbose)
+		do_relay(mut client, mut upstream, script, app.verbose, mut app)
 	}
 }
 
@@ -2879,7 +3169,7 @@ fn handle_sni(mut app App, mut client net.TcpConn, l Listener) {
 			return 
 		}
 	}
-	do_relay(mut client, mut upstream, []Rule{}, app.verbose)
+	do_relay(mut client, mut upstream, []Rule{}, app.verbose, mut app)
 }
 
 fn extract_sni(d []u8) string {
@@ -3072,7 +3362,17 @@ fn watchdog_loop(mut wd Watchdog) {
 					nodes: [check_node]
 					alive: true
 				}
-				alive = check_chain(temp_chain)
+				if temp_chain.nodes.len > 0 {
+					n := temp_chain.nodes[0]
+					match n.proto {
+						.socks5 { alive = check_socks5_h(n) }
+						.http { alive = check_http_h(n) }
+						.sni { alive = check_tcp_h(n.addr) }
+						.dns { alive = check_dns_h(n) }
+					}
+				} else {
+					alive = false
+				}
 			}
 
 			if alive {
@@ -3568,7 +3868,7 @@ fn queue_processor(mut app App) {
 			else {}
 		}
 		
-		spawn do_relay(mut req.client, mut upstream, script, app.verbose)
+		spawn do_relay(mut req.client, mut upstream, script, app.verbose, mut app)
 	}
 }
 
@@ -3587,7 +3887,7 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 	if app.hedge_delay == 0 {
 		mut all_failed := true
 		
-		for ci in order {
+				for ci in order {
 			app.mu.@lock()
 			nodes := app.chains[ci].nodes.clone()
 			is_alive := app.chains[ci].alive
@@ -3598,7 +3898,7 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 			}
 			
 			t0 := time.now()
-			conn := connect_chain(nodes, host, port, app.verbose) or {
+			mut conn := connect_chain(nodes, host, port, app.verbose, mut app) or {
 				app.mu.@lock()
 				record_failure(mut app.chains[ci])
 				app.mu.unlock()
