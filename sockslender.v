@@ -117,6 +117,49 @@ mut:
 	dns_sma    u32
 	req_queue  RequestQueue
 	freeze_mode bool
+	hedge_delay time.Duration
+}
+
+struct HedgeResult {
+	mut:
+	chain_idx int
+	conn &net.TcpConn = unsafe { nil }
+	script []Rule
+	latency i64
+	success bool
+}
+
+fn hedge_connect(mut app App, ci int, host string, port int, result_chan chan HedgeResult, delay time.Duration) {
+	if delay > 0 {
+		time.sleep(delay)
+	}
+	
+	app.mu.@lock()
+	nodes := app.chains[ci].nodes.clone()
+	app.mu.unlock()
+	
+	t0 := time.now()
+	conn := connect_chain(nodes, host, port, false) or {
+		app.mu.@lock()
+		record_failure(mut app.chains[ci])
+		app.mu.unlock()
+		
+		result_chan <- HedgeResult{
+			chain_idx: ci
+			success: false
+		}
+		return
+	}
+	
+	lat := i64(time.now() - t0) / 1000
+	
+	result_chan <- HedgeResult{
+		chain_idx: ci
+		conn: conn
+		script: nodes[0].script
+		latency: lat
+		success: true
+	}
 }
 
 struct PendingRequest {
@@ -1416,19 +1459,27 @@ fn main() {
 
 	mut apps := []&App{}
 
-	for box_idx, box_args in boxes_args {
+		for box_idx, box_args in boxes_args {
 		mut listeners := []Listener{}
 		mut chains := []Chain{}
 		mut macros := map[string][][]Node{}
 		mut global_outbound_str := ''
 		mut verbose := false
+		mut hedge_delay_ms := 0
 		mut rrr_entries := [][]string{}
 		mut i := 0
 
 		for i < box_args.len {
 			arg := box_args[i]
-
-			if arg == '-v' {
+			
+			if arg == '--hedge' && i + 1 < box_args.len {
+				hedge_delay_ms = box_args[i + 1].int()
+				if hedge_delay_ms < 50 {
+					hedge_delay_ms = 250
+				}
+				i += 2
+				continue
+			} else if arg == '-v' {
 				verbose = true
 				i++
 				continue
@@ -1787,11 +1838,15 @@ fn main() {
 			udp_port: u32(40000 + (box_idx * 1000))
 			verbose: verbose
 			dns_sma: u32(0)
+			hedge_delay: time.Duration(hedge_delay_ms * time.millisecond)
 		}
 		apps << app
 		println('[*] [Box ${app.id}] Parsed successfully. ${listeners.len} listener(s), ${chains.len} routing chain(s).')
 		if verbose {
 			println('    -> VERBOSE mode enabled for this Box.')
+		}
+		if hedge_delay_ms > 0 {
+			println('    -> HEDGE MODE: ${hedge_delay_ms}ms delay')
 		}
 	}
 
@@ -3529,39 +3584,98 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 		return error('queued_no_chains')
 	}
 	
-	mut all_failed := true
-	
-	for ci in order {
-		app.mu.@lock()
-		nodes := app.chains[ci].nodes.clone()
-		is_alive := app.chains[ci].alive
-		app.mu.unlock()
+	if app.hedge_delay == 0 {
+		mut all_failed := true
 		
-		if !is_alive {
-			continue
-		}
-		
-		t0 := time.now()
-		conn := connect_chain(nodes, host, port, app.verbose) or {
+		for ci in order {
 			app.mu.@lock()
-			record_failure(mut app.chains[ci])
+			nodes := app.chains[ci].nodes.clone()
+			is_alive := app.chains[ci].alive
 			app.mu.unlock()
-			continue
+			
+			if !is_alive {
+				continue
+			}
+			
+			t0 := time.now()
+			conn := connect_chain(nodes, host, port, app.verbose) or {
+				app.mu.@lock()
+				record_failure(mut app.chains[ci])
+				app.mu.unlock()
+				continue
+			}
+			
+			all_failed = false
+			lat := i64(time.now() - t0) / 1000
+			app.mu.@lock()
+			record_success(mut app.chains[ci], lat)
+			app.mu.unlock()
+			
+			return conn, nodes[0].script
 		}
 		
-		all_failed = false
-		lat := i64(time.now() - t0) / 1000
-		app.mu.@lock()
-		record_success(mut app.chains[ci], lat)
-		app.mu.unlock()
+		if all_failed {
+			app.enqueue_request(mut client, host, port, initial_data, l, req_type)
+			return error('queued_all_failed')
+		}
 		
-		return conn, nodes[0].script
+		return error('connection_failed')
 	}
 	
-	if all_failed {
-		app.enqueue_request(mut client, host, port, initial_data, l, req_type)
-		return error('queued_all_failed')
+	
+	mut hedge_count := if order.len > 3 { 3 } else { order.len }
+	result_chan := chan HedgeResult{cap: hedge_count}
+	
+	spawn hedge_connect(mut app, order[0], host, port, result_chan, 0)
+	
+	if app.verbose {
+		println('[HEDGE] Starting chain #${order[0]} immediately')
 	}
 	
-	return error('connection_failed')
+	for i in 1 .. hedge_count {
+		ci := order[i]
+		delay := app.hedge_delay * i
+		spawn hedge_connect(mut app, ci, host, port, result_chan, delay)
+		
+		if app.verbose {
+			println('[HEDGE] Scheduled chain #${ci} after ${delay}')
+		}
+	}
+	
+	mut received := 0
+	mut first_success := true
+	mut winners := []int{cap: hedge_count}
+	
+	for received < hedge_count {
+		mut result := <-result_chan
+		received++
+		
+		if result.success && first_success {
+			first_success = false
+			
+			app.mu.@lock()
+			record_success(mut app.chains[result.chain_idx], result.latency)
+			app.mu.unlock()
+			
+			if app.verbose {
+				println('[HEDGE] ✓ Winner: Chain #${result.chain_idx} (${result.latency}μs, ${received}/${hedge_count} started)')
+			}
+			return result.conn, result.script
+		}
+		if result.success {
+			winners << result.chain_idx
+			result.conn.close() or {}
+			
+			if app.verbose {
+				println('[HEDGE] Late winner chain #${result.chain_idx} closed (${result.latency}μs)')
+			}
+		}
+	}
+	
+	if app.verbose {
+		println('[HEDGE] ✗ All ${hedge_count} chains failed')
+	}
+	
+	app.enqueue_request(mut client, host, port, initial_data, l, req_type)
+	return error('queued_hedge_failed')
 }
