@@ -4,6 +4,7 @@ import time
 import sync
 import encoding.base64
 import encoding.hex
+import term
 
 $if !windows {
 	#include <sys/resource.h>
@@ -174,14 +175,14 @@ fn socket_janitor(mut app App) {
 			if now - managed.last_activity > 10 * time.minute {
 				to_close << handle
 				if app.verbose {
-					println('[Janitor] Closing stale connection: ${managed.purpose} (idle ${now - managed.last_activity})')
+					println('${term.yellow("[Janitor]")} Closing stale connection: ${managed.purpose} (idle ${now - managed.last_activity})')
 				}
 			}
 			
 			if now - managed.created_at > 1 * time.hour {
 				to_close << handle
 				if app.verbose {
-					println('[Janitor] Closing old connection: ${managed.purpose} (age ${now - managed.created_at})')
+					println('${term.yellow("[Janitor]")} Closing old connection: ${managed.purpose} (age ${now - managed.created_at})')
 				}
 			}
 		}
@@ -199,19 +200,19 @@ fn socket_janitor(mut app App) {
 		app.mu.unlock()
 		
 		if to_close.len > 0 {
-			println('[Janitor] Cleaned ${to_close.len} stale sockets')
+			println('${term.yellow("[Janitor]")} Cleaned ${to_close.len} stale sockets')
 		}
 		
 		active, peak, opened, closed := app.sock_mon.get_stats()
 		if app.verbose || active > 500 {
 			leaked := opened - closed - u64(active)
-			println('[Stats] Active: ${active}, Peak: ${peak}, Opened: ${opened}, Closed: ${closed}, Leaked: ${leaked}')
+			println('${term.green("[Stats]")} Active: ${active}, Peak: ${peak}, Opened: ${opened}, Closed: ${closed}, Leaked: ${leaked}')
 		}
 	}
 }
 
 fn (mut app App) emergency_cleanup() {
-	println('[!] EMERGENCY: Force closing old connections')
+	println('${term.red("[!]")} EMERGENCY: Force closing old connections')
 	
 	now := time.now()
 	mut closed_count := 0
@@ -243,7 +244,7 @@ fn (mut app App) emergency_cleanup() {
 	
 	app.mu.unlock()
 	
-	println('[!] Emergency cleanup: ${closed_count} connections force-closed')
+	println('${term.red("[!]")} Emergency cleanup: ${closed_count} connections force-closed')
 }
 
 fn emergency_monitor(mut app App) {
@@ -253,7 +254,7 @@ fn emergency_monitor(mut app App) {
 		active, _, _, _ := app.sock_mon.get_stats()
 		
 		if active >= app.sock_mon.max_allowed * 9 / 10 {
-			println('[!] Socket usage critical: ${active}/${app.sock_mon.max_allowed}')
+			println('${term.red("[!]")} Socket usage critical: ${active}/${app.sock_mon.max_allowed}')
 			app.emergency_cleanup()
 		}
 		
@@ -262,7 +263,7 @@ fn emergency_monitor(mut app App) {
 		app.req_queue.mu.unlock()
 		
 		if queue_len > 500 {
-			println('[!] Queue critical: ${queue_len} pending requests')
+			println('${term.red("[!]")} Queue critical: ${queue_len} pending requests')
 		}
 	}
 }
@@ -429,24 +430,24 @@ fn check_fd_limits() {
 	$if !windows {
 		mut rl := C.rlimit{}
 		if C.getrlimit(7, &rl) != 0 {
-			eprintln('[!] Cannot read FD limits')
+			eprintln('${term.red("[!]")} Cannot read FD limits')
 			return
 		}
 		soft := rl.rlim_cur
 		hard := rl.rlim_max
-		println('[*] FD limits: soft=${soft}, hard=${hard}')
+		println('${term.yellow("[*]")} FD limits: soft=${soft}, hard=${hard}')
 		if soft < 4096 && soft < hard {
 			mut target := if hard > 65536 { u64(65536) } else { hard }
 			rl.rlim_cur = target
 			if C.setrlimit(7, &rl) == 0 {
-				println('[*] FD soft limit raised: ${soft} -> ${target}')
+				println('${term.yellow("[*]")} FD soft limit raised: ${soft} -> ${target}')
 			} else {
 				target = if hard > 4096 { u64(4096) } else { hard }
 				rl.rlim_cur = target
 				if C.setrlimit(7, &rl) == 0 {
-					println('[*] FD soft limit raised: ${soft} -> ${target}')
+					println('${term.yellow("[*]")} FD soft limit raised: ${soft} -> ${target}')
 				} else {
-					eprintln('[!] WARNING: Cannot raise FD limit (stuck at ${soft})')
+					eprintln('${term.red("[!]")} WARNING: Cannot raise FD limit (stuck at ${soft})')
 					eprintln('    Run: ulimit -n 65536')
 				}
 			}
@@ -455,12 +456,12 @@ fn check_fd_limits() {
 		C.getrlimit(7, &rl2)
 		fl := rl2.rlim_cur
 		if fl < 1024 {
-			eprintln('[!] CRITICAL: FD limit is only ${fl}. Will crash under load!')
+			eprintln('${term.red("[!]")} CRITICAL: FD limit is only ${fl}. Will crash under load!')
 			eprintln('    Minimum: 1024, recommended: 4096+')
 		} else if fl < 4096 {
-			eprintln('[!] WARNING: FD limit is ${fl}. Heavy traffic may exhaust FDs.')
+			eprintln('${term.red("[!]")} WARNING: FD limit is ${fl}. Heavy traffic may exhaust FDs.')
 		} else {
-			println('[*] FD limit OK: ${fl}')
+			println('${term.red("[!]")} FD limit OK: ${fl}')
 		}
 	}
 }
@@ -860,68 +861,68 @@ fn apply_l3(fd int, rules []Rule, verbose bool) {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 0, 2, &val, u32(4))
 					if verbose {
-						println('  [L3] TTL=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3]")} TTL=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
 					}
 				}
 				'tos' {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 0, 1, &val, u32(4))
 					if verbose {
-						println('  [L3] TOS=0x${val:02x} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3]")} TOS=0x${val:02x} ${if res == 0 { 'OK' } else { 'FAIL' }}')
 					}
 				}
 				'mark' {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 1, 36, &val, u32(4))
 					if verbose {
-						println('  [L3] MARK=${val} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
+						println('  ${term.green("[L3]")} MARK=${val} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
 					}
 				}
 				'bind' {
 					dev := rule.l3_val
 					res := C.setsockopt(fd, 1, 25, dev.str, u32(dev.len + 1))
 					if verbose {
-						println('  [L3] BIND=${dev} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
+						println('  ${term.green("[L3]")} BIND=${dev} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
 					}
 				}
 				'df' {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 0, 10, &val, u32(4))
 					if verbose {
-						println('  [L3] DF=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3]")} DF=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
 					}
 				}
 				'tproxy' {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 0, 19, &val, u32(4))
 					if verbose {
-						println('  [L3] TPROXY=${val} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
+						println('  ${term.green("[L3]")} TPROXY=${val} ${if res == 0 { 'OK' } else { 'FAIL(root?)' }}')
 					}
 				}
 				'keepalive' {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 1, 9, &val, u32(4))
 					if verbose {
-						println('  [L3] KEEPALIVE=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3]")} KEEPALIVE=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
 					}
 				}
 				'nodelay' {
 					mut val := parse_int_or_hex(rule.l3_val)
 					res := C.setsockopt(fd, 6, 1, &val, u32(4))
 					if verbose {
-						println('  [L3] NODELAY=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3]")} NODELAY=${val} ${if res == 0 { 'OK' } else { 'FAIL' }}')
 					}
 				}
 				'delay' {
 					val := parse_int_or_hex(rule.l3_val)
 					time.sleep(val * time.millisecond)
 					if verbose {
-						println('  [G] DELAY=${val} OK')
+						println('  ${term.green("[G]")} DELAY=${val} OK')
 					}
 				}
 				else {
 					if verbose {
-						println('  [L3] Unknown: ${rule.l3_key}')
+						println('  ${term.green("[L3]")} Unknown: ${rule.l3_key}')
 					}
 				}
 			}
@@ -1090,7 +1091,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] FAKE skipped: TCP_REPAIR failed')
+							println('  ${term.gray("[L3R]")} FAKE skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1099,7 +1100,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						0x18, u8(ttl), fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] FAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} FAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1111,7 +1112,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] FAKETS skipped: TCP_REPAIR failed')
+							println('  ${term.red("[L3R]")} FAKETS skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1120,7 +1121,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						0, 0x18, u8(ttl), fake_payload, true)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] FAKETS TTL=${ttl} (with TCP timestamp) ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} FAKETS TTL=${ttl} (with TCP timestamp) ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1132,7 +1133,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] RST skipped: TCP_REPAIR failed')
+							println('  ${term.red("[L3R]")} RST skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1140,7 +1141,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						0x04, u8(ttl), []u8{})
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] RST TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} RST TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1153,7 +1154,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 							C.send(fd, voidptr(oob_data.data), oob_data.len, 1)
 						}
 						if verbose {
-							println('  [L3R] OOB ${if res > 0 { 'OK' } else { 'FAIL' }}')
+							println('  ${term.gray("[L3R]")} OOB ${if res > 0 { 'OK' } else { 'FAIL' }}')
 						}
 						time.sleep(1 * time.millisecond)
 					}
@@ -1166,7 +1167,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] SPOOF skipped: TCP_REPAIR failed')
+							println('  ${term.red("[L3R]")} SPOOF skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1175,7 +1176,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						0x18, 64, fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] SPOOF src=${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} SPOOF src=${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1192,7 +1193,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						0x04, 64, []u8{})
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] SPOOFED RST from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} SPOOFED RST from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1204,7 +1205,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] IPFRAG skipped: TCP_REPAIR failed')
+							println('  ${term.red("[L3R]")} IPFRAG skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1219,7 +1220,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] IPFRAG: ${fragments.len} frags (${frag_size}B), sent=${sent}')
+						println('  ${term.gray("[L3R]")} IPFRAG: ${fragments.len} frags (${frag_size}B), sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1244,7 +1245,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						time.sleep(500 * time.microsecond)
 					}
 					if verbose {
-						println('  [L3R] REVFRAG: ${fragments.len} reversed frags, sent=${sent}')
+						println('  ${term.gray("[L3R]")} REVFRAG: ${fragments.len} reversed frags, sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1256,7 +1257,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] MULTIFAKE skipped: TCP_REPAIR failed')
+							println('  ${term.red("[L3R]")} MULTIFAKE skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1272,7 +1273,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] MULTIFAKE: ${sent}/${count} sent')
+						println('  ${term.green("[L3R]")} MULTIFAKE: ${sent}/${count} sent')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1282,7 +1283,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					parts := rule.l3_val.split(':')
 					if parts.len != 2 {
 						if verbose {
-							println('  [L3R] SPOOFFRAG syntax: spooffrag=IP:fragsize')
+							println('  ${term.green("[L3R]")} SPOOFFRAG syntax: spooffrag=IP:fragsize')
 						}
 						continue
 					}
@@ -1304,7 +1305,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] SPOOFFRAG: ${fragments.len} frags from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]}, sent=${sent}')
+						println('  ${term.green("[L3R]")} SPOOFFRAG: ${fragments.len} frags from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]}, sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1326,7 +1327,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						0, 0x02, u8(ttl), fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] SYNFAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} SYNFAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1339,7 +1340,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						seq, seq_ok := get_tcp_seq(fd)
 						if !seq_ok {
 							if verbose {
-								println('  [L3R] DISORDER skipped')
+								println('  ${term.red("[L3R]")} DISORDER skipped')
 							}
 							continue
 						}
@@ -1350,7 +1351,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						conn.write(data[..pos]) or { return false }
 						conn.write(data[pos..]) or { return false }
 						if verbose {
-							println('  [L3R] DISORDER at ${pos}')
+							println('  ${term.green("[L3R]")} DISORDER at ${pos}')
 						}
 						return true
 					}
@@ -1362,7 +1363,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
 						if verbose {
-							println('  [L3R] BADCSUM skipped: TCP_REPAIR failed')
+							println('  ${term.red("[L3R]")} BADCSUM skipped: TCP_REPAIR failed')
 						}
 						continue
 					}
@@ -1373,7 +1374,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] BADCSUM sent ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} BADCSUM sent ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1390,7 +1391,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] FAKE TEARDOWN (FIN) sent ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} FAKE TEARDOWN (FIN) sent ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1405,7 +1406,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					
 					if verbose {
-						println('  [L3R] UDP FAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP FAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1423,7 +1424,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] UDP BADCSUM TTL=${ttl} sent ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP BADCSUM TTL=${ttl} sent ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1441,7 +1442,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] UDP ZEROCSUM TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP ZEROCSUM TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1456,7 +1457,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					
 					if verbose {
-						println('  [L3R] UDP SPOOF src=${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP SPOOF src=${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1477,7 +1478,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] UDP IPFRAG: ${fragments.len} frags (${frag_size}B), sent=${sent}')
+						println('  ${term.green("[L3R]")} UDP IPFRAG: ${fragments.len} frags (${frag_size}B), sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1499,7 +1500,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						time.sleep(500 * time.microsecond)
 					}
 					if verbose {
-						println('  [L3R] UDP REVFRAG: ${fragments.len} reversed frags, sent=${sent}')
+						println('  ${term.green("[L3R]")} UDP REVFRAG: ${fragments.len} reversed frags, sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1521,7 +1522,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] UDP MULTIFAKE: ${sent}/${count} sent')
+						println('  ${term.green("[L3R]")} UDP MULTIFAKE: ${sent}/${count} sent')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1531,7 +1532,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					parts := rule.l3_val.split(':')
 					if parts.len != 2 {
 						if verbose {
-							println('  [L3R] UDP SPOOFFRAG syntax: spooffrag=IP:fragsize')
+							println('  ${term.green("[L3R]")} UDP SPOOFFRAG syntax: spooffrag=IP:fragsize')
 						}
 						continue
 					}
@@ -1550,7 +1551,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] UDP SPOOFFRAG: ${fragments.len} frags from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]}, sent=${sent}')
+						println('  ${term.green("[L3R]")} UDP SPOOFFRAG: ${fragments.len} frags from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]}, sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1569,7 +1570,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  [L3R] UDP BADLENGTH TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP BADLENGTH TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1590,7 +1591,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 					time.sleep(1 * time.millisecond)
 					conn.write(data[pos..]) or { return false }
 					if verbose {
-						println('  [L3R] SPLIT at ${pos}: ${pos}+${data.len - pos}')
+						println('  ${term.green("[L3R]")} SPLIT at ${pos}: ${pos}+${data.len - pos}')
 					}
 					return true
 				}
@@ -1611,7 +1612,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 					}
 					if verbose {
-						println('  [L3R] SEG: ${seg_size}-byte chunks')
+						println('  ${term.green("[L3R]")} SEG: ${seg_size}-byte chunks')
 					}
 					return true
 				}
@@ -1631,7 +1632,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 						}
 						
 						if verbose {
-							println('  [L3R] UDP TAIL/FRAG at ${pos}: ${pos}+${data.len - pos}')
+							println('  ${term.green("[L3R]")} UDP TAIL/FRAG at ${pos}: ${pos}+${data.len - pos}')
 						}
 						return true 
 					}
@@ -1675,7 +1676,7 @@ fn main() {
 		}
 		wd.mu.unlock()
 		if total_killed > 0 {
-			println('\n[*] Shut down complete. Terminated ${total_killed} background task(s).')
+			println('\n${term.green("[*]")} Shut down complete. Terminated ${total_killed} background task(s).')
 		}
 	}
 
@@ -1696,7 +1697,7 @@ fn main() {
 		boxes_args << current_box
 	}
 	if boxes_args.len == 0 {
-		eprintln('Usage: ${os.args[0]} [-v] -l addr:port -u addr:port [:: -l addr:port ...]')
+		eprintln('${term.yellow("Usage")} ${os.args[0]} [-v] -l addr:port -u addr:port [:: -l addr:port ...]')
 		return
 	}
 
@@ -1742,7 +1743,7 @@ fn main() {
 						}
 						p.run()
 						child_procs << p
-						println('[*] [Global] Started background task: ${parts[0]} (PID: ${p.pid})')
+						println('${term.red("[!]")} [Global] Started background task: ${parts[0]} (PID: ${p.pid})')
 					}
 				}
 				i++
@@ -1751,13 +1752,13 @@ fn main() {
 				raw_content := arg[5..arg.len - 1]
 				comma_pos := raw_content.last_index(',') or { -1 }
 				if comma_pos <= 0 {
-					eprintln('[!] -rrr syntax: -rrr?command,endpoint_addr:port?')
+					eprintln('${term.red("[*]")} -rrr syntax: -rrr?command,endpoint_addr:port?')
 					exit(1)
 				}
 				rrr_cmd := raw_content[..comma_pos].trim_space()
 				rrr_ep := raw_content[comma_pos + 1..].trim_space()
 				if rrr_cmd == '' || rrr_ep == '' {
-					eprintln('[!] -rrr: empty command or endpoint')
+					eprintln('${term.red("[!]")} -rrr: empty command or endpoint')
 					exit(1)
 				}
 				rrr_entries << [rrr_cmd, rrr_ep]
@@ -1767,7 +1768,7 @@ fn main() {
 				raw_cmds := arg[4..arg.len - 1]
 				parts := raw_cmds.split(',')
 				if parts.len % 2 != 0 {
-					eprintln('[!] -rr syntax error: must be pairs of (command, endpoint)')
+					eprintln('${term.red("[!]")} -rr syntax error: must be pairs of (command, endpoint)')
 					exit(1)
 				}
 				wd.mu.@lock()
@@ -1779,7 +1780,7 @@ fn main() {
 					}
 					mut check_node := parse_uri(endpoint) or {
 						parse_uri('sni://' + endpoint) or {
-							eprintln('[!] [Watchdog] Invalid endpoint format: ${endpoint}')
+							eprintln('${term.red("[!]")} [Watchdog] Invalid endpoint format: ${endpoint}')
 							continue
 						}
 					}
@@ -1803,7 +1804,7 @@ fn main() {
 							.http { 'HTTP' }
 							else { 'TCP' }
 						}
-						println('[*] [Watchdog] Auto-restarting task added: "${cmd_parts[0]}" -> monitoring ${check_node.addr} via ${pname} handshake')
+						println('${term.green("[*]")} [Watchdog] Auto-restarting task added: "${cmd_parts[0]}" -> monitoring ${check_node.addr} via ${pname} handshake')
 					}
 				}
 				wd.mu.unlock()
@@ -1812,7 +1813,7 @@ fn main() {
 			} else if arg == '-l' && i + 1 < box_args.len {
 				raw_uri := box_args[i + 1]
 				node := parse_uri(raw_uri) or {
-					eprintln('[!] [Box ${box_idx + 1}] Listener Error: ${err}')
+					eprintln('${term.red("[!]")} [Box ${box_idx + 1}] Listener Error: ${err}')
 					exit(1)
 				}
 				mut existing_idx := -1
@@ -1860,7 +1861,7 @@ fn main() {
 								}
 							}
 						} else {
-							node := parse_uri(name) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
+							node := parse_uri(name) or { eprintln('${term.red("[!]")} Error parsing node: ${err}'); exit(1) }
 							mut new_chain_idxs := []int{}
 							for path in current_paths {
 								if path.len > 0 {
@@ -1915,7 +1916,7 @@ fn main() {
 								exit(1)
 							}
 						} else {
-							node := parse_uri(part) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
+							node := parse_uri(part) or { eprintln('${term.red("[!]")} Error parsing node: ${err}'); exit(1) }
 							for mut path in current_paths {
 								path << node
 							}
@@ -1938,7 +1939,7 @@ fn main() {
 				global_outbound_str = box_args[i + 1]
 				i += 2
 			} else {
-				eprintln('[!] [Box ${box_idx + 1}] Unknown argument: ${box_args[i]}')
+				eprintln('${term.red("[!]")} [Box ${box_idx + 1}] Unknown argument: ${box_args[i]}')
 				exit(1)
 			}
 		}
@@ -1968,7 +1969,7 @@ fn main() {
 						exit(1)
 					}
 				} else {
-					node := parse_uri(part) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
+					node := parse_uri(part) or { eprintln('${term.red("[!]")} Error parsing node: ${err}'); exit(1) }
 					for mut path in out_paths {
 						path << node
 					}
@@ -1987,7 +1988,7 @@ fn main() {
 		if rrr_entries.len > 0 {
 			pc_bin := find_proxychains_bin()
 			if pc_bin == '' {
-				eprintln('[!] proxychains4 not found! Install: apt install proxychains4')
+				eprintln('${term.red("[!]")} proxychains4 not found! Install: apt install proxychains4')
 				eprintln('    -rrr entries will be skipped.')
 			} else {
 				for rrr_idx, entry in rrr_entries {
@@ -1995,13 +1996,13 @@ fn main() {
 					rrr_endpoint := entry[1]
 					mut ep_addr := rrr_endpoint
 					if !ep_addr.contains(':') {
-						eprintln('[!] [Box ${box_idx + 1}] -rrr: invalid endpoint (missing port): ${rrr_endpoint}')
+						eprintln('${term.red("[!]")} [Box ${box_idx + 1}] -rrr: invalid endpoint (missing port): ${rrr_endpoint}')
 						continue
 					}
 					mut prior := find_prior_nodes(chains, ep_addr)
 					if prior.len == 0 {
 						for proto_prefix in ['socks5://', 'http://'] {
-							ep_node := parse_uri(proto_prefix + rrr_endpoint) or { eprintln('[!] Error parsing node: ${err}'); exit(1) }
+							ep_node := parse_uri(proto_prefix + rrr_endpoint) or { eprintln('${term.red("[!]")} Error parsing node: ${err}'); exit(1) }
 							prior = find_prior_nodes(chains, ep_node.addr)
 							if prior.len > 0 {
 								break
@@ -2009,7 +2010,7 @@ fn main() {
 						}
 					}
 					if prior.len == 0 {
-						eprintln('[!] [Box ${box_idx + 1}] -rrr: "${ep_addr}" not found in any chain, or is the first node')
+						eprintln('${term.red("[!]")} [Box ${box_idx + 1}] -rrr: "${ep_addr}" not found in any chain, or is the first node')
 						eprintln('    Available chain nodes:')
 						for ci, c in chains {
 							mut addrs := []string{}
@@ -2022,7 +2023,7 @@ fn main() {
 					}
 					conf_path := gen_proxychains_conf(prior, box_idx + 1, rrr_idx)
 					if conf_path == '' {
-						eprintln('[!] -rrr: failed to write proxychains config')
+						eprintln('${term.red("[!]")} -rrr: failed to write proxychains config')
 						continue
 					}
 					cmd_parts := rrr_cmd_str.split(' ').filter(it != '')
@@ -2038,7 +2039,7 @@ fn main() {
 					p.run()
 					check_node := parse_uri(rrr_endpoint) or {
 						parse_uri('socks5://' + rrr_endpoint) or {
-							eprintln('[!] -rrr: cannot parse endpoint for monitoring')
+							eprintln('${term.red("[!]")} -rrr: cannot parse endpoint for monitoring')
 							continue
 						}
 					}
@@ -2061,7 +2062,7 @@ fn main() {
 						}
 						chain_desc << '${pt}://${n.addr}'
 					}
-					println('[*] [Box ${box_idx + 1}] -rrr: "${rrr_cmd_str}" tunneled via:')
+					println('${term.green("[*]")} [Box ${box_idx + 1}] -rrr: "${rrr_cmd_str}" tunneled via:')
 					println('    ${chain_desc.join(' -> ')} -> ${ep_addr}')
 					println('    PID: ${p.pid} | proxychains: ${pc_bin} | config: ${conf_path}')
 				}
@@ -2069,7 +2070,7 @@ fn main() {
 		}
 
 		if listeners.len == 0 {
-			eprintln('[!] [Box ${box_idx + 1}] Skipped: No listeners defined.')
+			eprintln('${term.red("[!]")} [Box ${box_idx + 1}] Skipped: No listeners defined.')
 			continue
 		}
 
@@ -2084,7 +2085,7 @@ fn main() {
 			hedge_delay: time.Duration(hedge_delay_ms * time.millisecond)
 		}
 		apps << app
-		println('[*] [Box ${app.id}] Parsed successfully. ${listeners.len} listener(s), ${chains.len} routing chain(s).')
+		println('${term.green("[*]")} [Box ${app.id}] Parsed successfully. ${listeners.len} listener(s), ${chains.len} routing chain(s).')
 		if verbose {
 			println('    -> VERBOSE mode enabled for this Box.')
 		}
@@ -2094,10 +2095,10 @@ fn main() {
 	}
 
 	if apps.len == 0 {
-		eprintln('[!] No valid boxes found to start.')
+		eprintln('${term.red("[!]")} No valid boxes found to start.')
 		return
 	}
-	println('[*] Starting ${apps.len} independent Box(es)...')
+	println('${term.green("[*]")} Starting ${apps.len} independent Box(es)...')
 
 	spawn watchdog_loop(mut wd)
 	
@@ -2159,7 +2160,7 @@ fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 			}
 			for idx in indices {
 				if verbose {
-					println('  [+] AOB MATCHED at relative offset ${idx}! Applying action.')
+					println('  ${term.green("[+]")} AOB MATCHED at relative offset ${idx}! Applying action.')
 				}
 				apply_action(mut buf, nr, idx + rule.action_start, rule.action_hex)
 			}
@@ -2176,7 +2177,7 @@ fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 					}
 					if matched {
 						if verbose {
-							println('  [+] IF MATCHED at offset ${rule.cond_start}. Applying action.')
+							println('  ${term.green("[+]")} IF MATCHED at offset ${rule.cond_start}. Applying action.')
 						}
 						apply_action(mut buf, nr, rule.action_start, rule.action_hex)
 					} else if rule.has_else {
@@ -2187,7 +2188,7 @@ fn apply_script(mut buf []u8, nr int, script []Rule, verbose bool) {
 				}
 			} else {
 				if verbose {
-					println('  [+] Unconditional action applied at offset ${rule.action_start}.')
+					println('  ${term.green("[+]")} Unconditional action applied at offset ${rule.action_start}.')
 				}
 				apply_action(mut buf, nr, rule.action_start, rule.action_hex)
 			}
@@ -2224,13 +2225,13 @@ fn relay(mut src net.TcpConn, mut dst net.TcpConn, done chan bool, script []Rule
 		app.mu.unlock()
 		
 		if verbose {
-			println('\n[-] Traffic In (${nr} bytes): ${hex.encode(b[..nr])}')
+			println('\n${term.cyan("[-]")} Traffic In (${nr} bytes): ${hex.encode(b[..nr])}')
 		}
 		mut data := b[..nr].clone()
 		if script.len > 0 {
 			apply_script(mut data, data.len, script, verbose)
 			if verbose {
-				println('[+] Traffic Out (${data.len} bytes): ${hex.encode(data)}')
+				println('${term.blue("[+]")} Traffic Out (${data.len} bytes): ${hex.encode(data)}')
 			}
 		}
 		if is_first {
@@ -2267,7 +2268,7 @@ fn start_listener(mut app App, li int) {
 	}
 	if l.proto == .dns {
 		mut listener := net.listen_udp(l.addr) or { return }
-		println('[+] [Box ${app.id}] ${pname} on ${l.addr} (UDP)')
+		println('${term.green("[+]")} [Box ${app.id}] ${pname} on ${l.addr} (UDP)')
 		for {
 			mut buf := []u8{len: 2048}
 			mut n, mut addr := listener.read(mut buf) or { continue }
@@ -2278,7 +2279,7 @@ fn start_listener(mut app App, li int) {
 		return
 	}
 	mut listener := net.listen_tcp(.ip, l.addr) or { return }
-	println('[+] [Box ${app.id}] ${pname} on ${l.addr} (TCP)')
+	println('${term.green("[+]")} [Box ${app.id}] ${pname} on ${l.addr} (TCP)')
 	for {
 		mut conn := listener.accept() or { continue }
 		spawn handle_conn(mut app, mut conn, li)
@@ -2635,7 +2636,7 @@ fn connect_chain(chain []Node, host string, port int, verbose bool, mut app App)
 		}
 
 		if verbose {
-			println('  [Chain] Tunneling through ${prev_node.addr} to reach ${next_node.addr}...')
+			println('  ${term.green("[Chain]")} Tunneling through ${prev_node.addr} to reach ${next_node.addr}...')
 		}
 		
 		match prev_node.proto {
@@ -2661,7 +2662,7 @@ fn connect_chain(chain []Node, host string, port int, verbose bool, mut app App)
 	last_node := chain.last()
 	
 	if verbose {
-		println('  [Chain] Final node ${last_node.addr} connecting to target ${host}:${port}...')
+		println('  ${term.green("[Chain]")} Final node ${last_node.addr} connecting to target ${host}:${port}...')
 	}
 
 	match last_node.proto {
@@ -3399,9 +3400,9 @@ fn watchdog_loop(mut wd Watchdog) {
 				.sni { 'TCP' }
 			}
 			if proc_alive {
-				println('\n[!] [Watchdog] FREEZE DETECTED: "${cmd}" alive but ${pname} handshake failed at ${check_node.addr} (restart #${new_rc})')
+				println('\n${term.red("[!]")} [Watchdog] FREEZE DETECTED: "${cmd}" alive but ${pname} handshake failed at ${check_node.addr} (restart #${new_rc})')
 			} else {
-				println('\n[!] [Watchdog] CRASH DETECTED: "${cmd}" is dead (restart #${new_rc})')
+				println('\n${term.red("[!]")} [Watchdog] CRASH DETECTED: "${cmd}" is dead (restart #${new_rc})')
 			}
 			if wd.procs[idx].proc.is_alive() {
 				wd.procs[idx].proc.signal_kill()
@@ -3433,7 +3434,7 @@ fn watchdog_loop(mut wd Watchdog) {
 				println('    -> Restarted (PID: ${new_p.pid}). Next check in ${next_cd}s.')
 			}
 			if new_rc >= 5 {
-				println('    [!] WARNING: "${cmd}" restarted ${new_rc} times!')
+				println('    ${term.red("[!]")} WARNING: "${cmd}" restarted ${new_rc} times!')
 			}
 			wd.mu.unlock()
 		}
@@ -3444,7 +3445,7 @@ fn check_raw_socket_cap() {
 	$if !windows {
 		test_fd := unsafe { C.socket(net.AddrFamily(2), net.SocketType(3), 255) }
 		if test_fd < 0 {
-			eprintln('[!] WARNING: Cannot create raw sockets. L3R rules (fake/rst/disorder) will NOT work!')
+			eprintln('${term.red("[!]")} WARNING: Cannot create raw sockets. L3R rules (fake/rst/disorder) will NOT work!')
 			eprintln('    Fix: run as root, or: sudo setcap cap_net_raw,cap_net_admin+ep <binary>')
 		} else {
 			C.close(test_fd)
@@ -3454,10 +3455,10 @@ fn check_raw_socket_cap() {
 				res := C.setsockopt(dummy_fd, 6, 19, &one, u32(4))
 				C.close(dummy_fd)
 				if res != 0 {
-					eprintln('[!] WARNING: TCP_REPAIR unavailable. fake/rst/disorder seq numbers will be wrong!')
+					eprintln('${term.yellow("[!]")} WARNING: TCP_REPAIR unavailable. fake/rst/disorder seq numbers will be wrong!')
 					eprintln('    Fix: sudo setcap cap_net_raw,cap_net_admin+ep <binary>')
 				} else {
-					println('[*] Raw socket + TCP_REPAIR: OK')
+					println('${term.green("[*]")} Raw socket + TCP_REPAIR: OK')
 				}
 			}
 		}
@@ -3718,7 +3719,7 @@ fn (mut app App) enqueue_request(mut client net.TcpConn, host string, port int, 
 			app.req_queue.queue[oldest_idx].client.close() or {}
 			app.req_queue.queue.delete(oldest_idx)
 			if app.verbose {
-				println('[!] [Box ${app.id}] Queue full - dropped oldest request')
+				println('${term.red("[!]")} [Box ${app.id}] Queue full - dropped oldest request')
 			}
 		}
 	}
@@ -3735,7 +3736,7 @@ fn (mut app App) enqueue_request(mut client net.TcpConn, host string, port int, 
 	}
 	
 	if app.verbose {
-		println('[*] [Box ${app.id}] Request queued: ${host}:${port} [${req_type}] (queue: ${app.req_queue.queue.len})')
+		println('${term.green("[*]")} [Box ${app.id}] Request queued: ${host}:${port} [${req_type}] (queue: ${app.req_queue.queue.len})')
 	}
 	
 	return true
@@ -3754,7 +3755,7 @@ fn queue_processor(mut app App) {
 			if app.freeze_mode {
 				app.freeze_mode = false
 				if app.verbose {
-					println('[*] [Box ${app.id}] Exiting freeze mode - connections restored')
+					println('${term.green("[*]")} [Box ${app.id}] Exiting freeze mode - connections restored')
 				}
 			}
 			app.mu.unlock()
@@ -3773,7 +3774,7 @@ fn queue_processor(mut app App) {
 		if !has_alive {
 			if !app.freeze_mode {
 				app.freeze_mode = true
-				println('[!] [Box ${app.id}] FREEZE MODE: All chains dead - holding ${queue_size} requests')
+				println('${term.red("[!]")} [Box ${app.id}] FREEZE MODE: All chains dead - holding ${queue_size} requests')
 			}
 			app.mu.unlock()
 			continue
@@ -3781,7 +3782,7 @@ fn queue_processor(mut app App) {
 		
 		if app.freeze_mode {
 			app.freeze_mode = false
-			println('[*] [Box ${app.id}] ✓ Unfreezing - processing ${queue_size} queued requests')
+			println('${term.green("[*]")} [Box ${app.id}] ✓ Unfreezing - processing ${queue_size} queued requests')
 		}
 		app.mu.unlock()
 		
@@ -3797,7 +3798,7 @@ fn queue_processor(mut app App) {
 		
 		if time.now() - req.queued_at > app.req_queue.max_wait {
 			if app.verbose {
-				println('[!] [Box ${app.id}] Request timeout: ${req.host}:${req.port} (waited ${time.now() - req.queued_at})')
+				println('${term.red("[!]")} [Box ${app.id}] Request timeout: ${req.host}:${req.port} (waited ${time.now() - req.queued_at})')
 			}
 			req.client.close() or {}
 			continue
@@ -3811,11 +3812,11 @@ fn queue_processor(mut app App) {
 				app.req_queue.mu.unlock()
 				
 				if app.verbose {
-					println('[!] [Box ${app.id}] Re-queuing: ${req.host}:${req.port} (attempt ${req.attempts}/${15})')
+					println('${term.red("[!]")} [Box ${app.id}] Re-queuing: ${req.host}:${req.port} (attempt ${req.attempts}/${15})')
 				}
 			} else {
 				if app.verbose {
-					println('[!] [Box ${app.id}] ✗ Giving up: ${req.host}:${req.port} after ${req.attempts} attempts')
+					println('${term.red("[!]")} [Box ${app.id}] ✗ Giving up: ${req.host}:${req.port} after ${req.attempts} attempts')
 				}
 				req.client.close() or {}
 			}
@@ -3823,7 +3824,7 @@ fn queue_processor(mut app App) {
 		}
 		
 		if app.verbose {
-			println('[+] [Box ${app.id}] ✓ Connected queued request: ${req.host}:${req.port} (attempt ${req.attempts}, waited ${time.now() - req.queued_at})')
+			println('${term.green("[+]")} [Box ${app.id}] ✓ Connected queued request: ${req.host}:${req.port} (attempt ${req.attempts}, waited ${time.now() - req.queued_at})')
 		}
 		
 		match req.req_type {
@@ -3929,7 +3930,7 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 	spawn hedge_connect(mut app, order[0], host, port, result_chan, 0)
 	
 	if app.verbose {
-		println('[HEDGE] Starting chain #${order[0]} immediately')
+		println('${term.green("[HEDGE]")} Starting chain #${order[0]} immediately')
 	}
 	
 	for i in 1 .. hedge_count {
@@ -3938,7 +3939,7 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 		spawn hedge_connect(mut app, ci, host, port, result_chan, delay)
 		
 		if app.verbose {
-			println('[HEDGE] Scheduled chain #${ci} after ${delay}')
+			println('${term.green("[HEDGE]")} Scheduled chain #${ci} after ${delay}')
 		}
 	}
 	
@@ -3958,7 +3959,7 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 			app.mu.unlock()
 			
 			if app.verbose {
-				println('[HEDGE] ✓ Winner: Chain #${result.chain_idx} (${result.latency}μs, ${received}/${hedge_count} started)')
+				println('${term.green("[HEDGE]")} ✓ Winner: Chain #${result.chain_idx} (${result.latency}μs, ${received}/${hedge_count} started)')
 			}
 			return result.conn, result.script
 		}
@@ -3967,13 +3968,13 @@ fn connect_retry_with_queue(mut app App, host string, port int, l Listener, mut 
 			result.conn.close() or {}
 			
 			if app.verbose {
-				println('[HEDGE] Late winner chain #${result.chain_idx} closed (${result.latency}μs)')
+				println('${term.yellow("[HEDGE]")} Late winner chain #${result.chain_idx} closed (${result.latency}μs)')
 			}
 		}
 	}
 	
 	if app.verbose {
-		println('[HEDGE] ✗ All ${hedge_count} chains failed')
+		println('${term.red("[HEDGE]")} ✗ All ${hedge_count} chains failed')
 	}
 	
 	app.enqueue_request(mut client, host, port, initial_data, l, req_type)
