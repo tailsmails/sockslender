@@ -542,7 +542,7 @@ fn find_proxychains_bin() string {
 	return ''
 }
 
-fn find_prior_nodes(chains []Chain, endpoint_addr string)[]Node {
+fn find_prior_nodes(chains[]Chain, endpoint_addr string)[]Node {
 	for c in chains {
 		for i, n in c.nodes {
 			if n.addr == endpoint_addr && i > 0 {
@@ -753,7 +753,7 @@ fn is_rule_start(s string) bool {
 }
 
 fn smart_split_comma(raw string) []string {
-	mut result := []string{}
+	mut result :=[]string{}
 	mut current :=[]u8{}
 	mut in_l3 := false
 	bytes := raw.bytes()
@@ -970,7 +970,7 @@ fn ip_checksum(data[]u8) u16 {
 	return u16(~sum & 0xFFFF)
 }
 
-fn tcp_checksum(src_ip []u8, dst_ip []u8, tcp_data[]u8) u16 {
+fn tcp_checksum(src_ip []u8, dst_ip[]u8, tcp_data[]u8) u16 {
 	tl := tcp_data.len
 	mut pseudo :=[]u8{len: 12 + tl}
 	for i in 0 .. 4 {
@@ -989,7 +989,7 @@ fn tcp_checksum(src_ip []u8, dst_ip []u8, tcp_data[]u8) u16 {
 
 fn get_sock_info(fd int) ([]u8, u16,[]u8, u16) {
 	$if !windows {
-		mut local_buf := [16]u8{}
+		mut local_buf :=[16]u8{}
 		mut remote_buf := [16]u8{}
 		mut alen := u32(16)
 		unsafe {
@@ -997,7 +997,7 @@ fn get_sock_info(fd int) ([]u8, u16,[]u8, u16) {
 			alen = u32(16)
 			C.getpeername(fd, voidptr(&remote_buf), &alen)
 		}
-		src_ip := [local_buf[4], local_buf[5], local_buf[6], local_buf[7]]
+		src_ip :=[local_buf[4], local_buf[5], local_buf[6], local_buf[7]]
 		src_port := (u16(local_buf[2]) << 8) | u16(local_buf[3])
 		dst_ip := [remote_buf[4], remote_buf[5], remote_buf[6], remote_buf[7]]
 		dst_port := (u16(remote_buf[2]) << 8) | u16(remote_buf[3])
@@ -1023,9 +1023,9 @@ fn get_tcp_seq(fd int) (u32, bool) {
 	return u32(0), false
 }
 
-fn build_raw_tcp(src_ip []u8, dst_ip[]u8, src_port u16, dst_port u16, seq u32, ack u32, flags u8, ttl u8, payload []u8)[]u8 {
+fn build_raw_tcp(src_ip[]u8, dst_ip[]u8, src_port u16, dst_port u16, seq u32, ack u32, flags u8, ttl u8, payload []u8)[]u8 {
 	total := 40 + payload.len
-	mut pkt := []u8{len: total}
+	mut pkt :=[]u8{len: total}
 	pkt[0] = 0x45
 	pkt[2] = u8(total >> 8)
 	pkt[3] = u8(total & 0xFF)
@@ -1100,6 +1100,35 @@ fn has_l3r_rules(script[]Rule) bool {
 	return false
 }
 
+fn find_sni_middle_offset(d[]u8) int {
+	if d.len < 44 || d[0] != 0x16 || d[5] != 0x01 {
+		return -1
+	}
+	mut p := 43
+	if p >= d.len { return -1 }
+	p += 1 + int(d[p])
+	if p + 2 > d.len { return -1 }
+	p += 2 + ((u16(d[p]) << 8) | u16(d[p + 1]))
+	if p >= d.len { return -1 }
+	p += 1 + int(d[p])
+	if p + 2 > d.len { return -1 }
+	ext_len := (u16(d[p]) << 8) | u16(d[p + 1])
+	p += 2
+	ext_end := p + ext_len
+	for p + 4 <= ext_end && p + 4 <= d.len {
+		et := (u16(d[p]) << 8) | u16(d[p + 1])
+		el := (u16(d[p + 2]) << 8) | u16(d[p + 3])
+		if et == 0 && el >= 5 && p + 9 <= d.len {
+			sn_len := (u16(d[p + 7]) << 8) | u16(d[p + 8])
+			if p + 9 + sn_len <= d.len {
+				return p + 9 + (sn_len / 2)
+			}
+		}
+		p += 4 + el
+	}
+	return -1
+}
+
 fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool {
 	fd := conn.sock.handle
 	
@@ -1108,6 +1137,38 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 			continue
 		}
 		match rule.l3_key {
+			'hoax' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if seq_ok {
+						fake_payload := "GET / HTTP/1.1\r\nHost: aparat.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n".bytes()
+						pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
+						ok := send_raw_packet(dst_ip, dst_port, pkt)
+						if verbose {
+							println('  ${term.green("[L3R]")} HOAX TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
+						}
+						time.sleep(2 * time.millisecond)
+					}
+				}
+			}
+			'overlap' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if seq_ok {
+						fake_payload := gen_fake_payload(data.len, 42)
+						pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
+						ok := send_raw_packet(dst_ip, dst_port, pkt)
+						if verbose {
+							println('  ${term.green("[L3R]")} OVERLAP TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
+						}
+						time.sleep(2 * time.millisecond)
+					}
+				}
+			}
 			'fake' {
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
@@ -1608,6 +1669,45 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 			continue
 		}
 		match rule.l3_key {
+			'splitsni' {
+				offset := find_sni_middle_offset(data)
+				if offset > 0 {
+					conn.write(data[..offset]) or { return false }
+					time.sleep(2 * time.millisecond)
+					conn.write(data[offset..]) or { return false }
+					if verbose {
+						println('  ${term.green("[L3R]")} SPLITSNI at ${offset}')
+					}
+					return true
+				}
+			}
+			'splithttp' {
+				s := data.bytestr()
+				if s.starts_with('GET ') || s.starts_with('POST ') || s.starts_with('CONNECT ') {
+					host_idx := s.index('Host: ') or { -1 }
+					if host_idx > 0 && host_idx + 8 < data.len {
+						offset := host_idx + 8
+						conn.write(data[..offset]) or { return false }
+						time.sleep(2 * time.millisecond)
+						conn.write(data[offset..]) or { return false }
+						if verbose {
+							println('  ${term.green("[L3R]")} SPLITHTTP at ${offset}')
+						}
+						return true
+					}
+				}
+			}
+			'split1' {
+				if data.len > 1 {
+					conn.write(data[..1]) or { return false }
+					time.sleep(2 * time.millisecond)
+					conn.write(data[1..]) or { return false }
+					if verbose {
+						println('  ${term.green("[L3R]")} SPLIT1 (Bypass 1st byte inspector)')
+					}
+					return true
+				}
+			}
 			'split' {
 				pos := parse_int_or_hex(rule.l3_val)
 				if pos > 0 && pos < data.len {
@@ -1728,7 +1828,7 @@ fn main() {
 	mut apps :=[]&App{}
 
 		for box_idx, box_args in boxes_args {
-		mut listeners := []Listener{}
+		mut listeners :=[]Listener{}
 		mut chains :=[]Chain{}
 		mut macros := map[string][][]Node{}
 		mut global_outbound_str := ''
@@ -1785,7 +1885,7 @@ fn main() {
 					eprintln('${term.red("[!]")} -rrr: empty command or endpoint')
 					exit(1)
 				}
-				rrr_entries << [rrr_cmd, rrr_ep]
+				rrr_entries <<[rrr_cmd, rrr_ep]
 				i++
 				continue
 			} else if arg.starts_with('-rr?') && arg.ends_with('?') {
@@ -1837,7 +1937,7 @@ fn main() {
 			} else if arg == '-l' && i + 1 < box_args.len {
 				raw_uri := box_args[i + 1]
 				node := parse_uri(raw_uri) or {
-					eprintln('${term.red("[!]")} [Box ${box_idx + 1}] Listener Error: ${err}')
+					eprintln('${term.red("[!]")}[Box ${box_idx + 1}] Listener Error: ${err}')
 					exit(1)
 				}
 				mut existing_idx := -1
@@ -3482,7 +3582,7 @@ fn build_raw_tcp_ex(src_ip[]u8, dst_ip[]u8, src_port u16, dst_port u16, seq u32,
 
 fn build_ip_fragments(full_pkt[]u8, frag_size int) [][]u8 {
 	if full_pkt.len <= 20 {
-		return [full_pkt.clone()]
+		return[full_pkt.clone()]
 	}
 	ip_payload := full_pkt[20..]
 	mut fs := frag_size
