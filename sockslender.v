@@ -1129,25 +1129,59 @@ fn find_sni_middle_offset(d[]u8) int {
 	return -1
 }
 
-fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) bool {
+fn encode_dns_name(domain string) []u8 {
+	mut res := []u8{}
+	parts := domain.split('.')
+	for part in parts {
+		if part.len > 0 {
+			res << u8(part.len)
+			res << part.bytes()
+		}
+	}
+	res << 0
+	return res
+}
+
+fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bool {
 	fd := conn.sock.handle
 
+	mut fake_domain := 'aparat.com'
+	
 	for rule in script {
 		if rule.mode != 'l3r' {
 			continue
 		}
 		match rule.l3_key {
+			'domain' {
+				fake_domain = rule.l3_val
+			}
 			'hoax' {
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if seq_ok {
-						fake_payload := "GET / HTTP/1.1\r\nHost: aparat.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n".bytes()
+						fake_payload := "GET / HTTP/1.1\r\nHost: ${fake_domain}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n".bytes()
 						pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
 						ok := send_raw_packet(dst_ip, dst_port, pkt)
 						if verbose {
-							println('  ${term.green("[L3R]")} HOAX TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
+							println('  ${term.green("[L3R]")} HOAX TTL=${ttl} DOMAIN=${fake_domain} ${if ok { "OK" } else { "FAIL" }}')
+						}
+						time.sleep(2 * time.millisecond)
+					}
+				}
+			}
+			'tls_hoax' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if seq_ok {
+						fake_tls := hex.decode("16030100c6010000c203035c115c115c115c115c115c115c115c115c115c115c115c115c115c115c115c11000020c02bc02fc02cc030cca9cca8cc14cc13c013c014009c009d002f0035000a") or {[]u8{} }
+						pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_tls)
+						ok := send_raw_packet(dst_ip, dst_port, pkt)
+						if verbose {
+							println('  ${term.green("[L3R]")} TLS_HOAX TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 						}
 						time.sleep(2 * time.millisecond)
 					}
@@ -1217,7 +1251,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) boo
 							time.sleep(200 * time.microsecond)
 						}
 						if verbose {
-							println('  ${term.green("[L3R]")} TTL_BRACKET [${min_ttl}-${max_ttl}] sent=${sent}')
+							println('  ${term.green("[L3R]")} TTL_BRACKET[${min_ttl}-${max_ttl}] sent=${sent}')
 						}
 						time.sleep(1 * time.millisecond)
 					}
@@ -1378,6 +1412,22 @@ fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) boo
 					time.sleep(1 * time.millisecond)
 				}
 			}
+			'tos_trick' {
+				$if !windows {
+					tos_val := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if seq_ok {
+						mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 64, data)
+						pkt[1] = u8(tos_val)
+						ok := send_raw_packet(dst_ip, dst_port, pkt)
+						if verbose {
+							println('  ${term.green("[L3R]")} TOS_TRICK val=${tos_val} ${if ok { "OK" } else { "FAIL" }}')
+						}
+						time.sleep(1 * time.millisecond)
+					}
+				}
+			}
 			'ipfrag' {
 				$if !windows {
 					frag_size := parse_int_or_hex(rule.l3_val)
@@ -1399,6 +1449,26 @@ fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) boo
 						println('  ${term.gray("[L3R]")} IPFRAG: ${fragments.len} frags sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
+				}
+			}
+			'ipfrag_overlap' {
+				$if !windows {
+					frag_size := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if seq_ok {
+						fake_payload := gen_fake_payload(data.len, 10)
+						full_fake_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 64, fake_payload)
+						fragments := build_ip_fragments(full_fake_pkt, frag_size)
+						mut sent := 0
+						for frag in fragments {
+							if send_raw_packet(dst_ip, dst_port, frag) { sent++ }
+						}
+						if verbose {
+							println('  ${term.green("[L3R]")} IPFRAG_OVERLAP sent=${sent}')
+						}
+						time.sleep(1 * time.millisecond)
+					}
 				}
 			}
 			'revfrag' {
@@ -1559,6 +1629,40 @@ fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) boo
 						println('  ${term.green("[L3R]")} UDP_FAKE TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
+				}
+			}
+			'udp_dns_fake' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					mut fake_dns_payload := []u8{cap: 64}
+					fake_dns_payload << [u8(0x12), 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+					fake_dns_payload << encode_dns_name(fake_domain)
+					fake_dns_payload << [u8(0x00), 0x01, 0x00, 0x01]
+					pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, u8(ttl), fake_dns_payload)
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} UDP_DNS_FAKE TTL=${ttl} DOMAIN=${fake_domain} ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'udp_chaff' {
+				$if !windows {
+					count := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					mut fake_dns := []u8{cap: 64}
+					fake_dns << [u8(0x12), 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+					fake_dns << encode_dns_name(fake_domain)
+					fake_dns << [u8(0x00), 0x01, 0x00, 0x01]
+					for _ in 0 .. count {
+						pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, 64, fake_dns)
+						send_raw_packet(dst_ip, dst_port, pkt)
+						time.sleep(500 * time.microsecond)
+					}
+					if verbose {
+						println('  ${term.green("[L3R]")} UDP_CHAFF count=${count} DOMAIN=${fake_domain}')
+					}
 				}
 			}
 			'udpbadcsum' {
@@ -1733,7 +1837,7 @@ fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) boo
 						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 						seq, seq_ok := get_tcp_seq(fd)
 						if seq_ok {
-							fake_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + 100000, 0, 0x18, 64, "youtube.com".bytes())
+							fake_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + 100000, 0, 0x18, 64, fake_domain.bytes())
 							send_raw_packet(dst_ip, dst_port, fake_pkt)
 						}
 					}
@@ -1824,6 +1928,43 @@ fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) boo
 					}
 					if verbose {
 						println('  ${term.green("[L3R]")} SEG: ${seg_size}')
+					}
+					return true
+				}
+			}
+			'random_split_delay' {
+				if data.len > 10 {
+					mut offset := 0
+					for offset < data.len {
+						mut chunk_size := int(time.now().unix_nano() % 10) + 5
+						if offset + chunk_size > data.len {
+							chunk_size = data.len - offset
+						}
+						conn.write(data[offset..offset+chunk_size]) or { return false }
+						offset += chunk_size
+						delay := int(time.now().unix_nano() % 5) + 1
+						time.sleep(delay * time.millisecond)
+					}
+					if verbose {
+						println('  ${term.green("[L3R]")} RANDOM_SPLIT_DELAY')
+					}
+					return true
+				}
+			}
+			'random_split' {
+				if data.len > 10 {
+					mut offset := 0
+					for offset < data.len {
+						mut chunk_size := int(time.now().unix_nano() % 15) + 3
+						if offset + chunk_size > data.len {
+							chunk_size = data.len - offset
+						}
+						conn.write(data[offset..offset+chunk_size]) or { return false }
+						offset += chunk_size
+						time.sleep(1 * time.millisecond)
+					}
+					if verbose {
+						println('  ${term.green("[L3R]")} RANDOM_SPLIT')
 					}
 					return true
 				}
