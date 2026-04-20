@@ -1129,9 +1129,9 @@ fn find_sni_middle_offset(d[]u8) int {
 	return -1
 }
 
-fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool {
+fn desync_write(mut conn net.TcpConn, data []u8, script[]Rule, verbose bool) bool {
 	fd := conn.sock.handle
-	
+
 	for rule in script {
 		if rule.mode != 'l3r' {
 			continue
@@ -1169,23 +1169,133 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					}
 				}
 			}
+			'overlap1byte' {
+				$if !windows {
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok {
+						continue
+					}
+					fake_payload :=[u8(0x58)]
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq - 1, 0, 0x18, 64, fake_payload)
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} OVERLAP1BYTE ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'oow' {
+				$if !windows {
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok { continue }
+					oow_seq := seq + 1000000 
+					fake_payload := gen_fake_payload(data.len, 88)
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, oow_seq, 0, 0x18, 64, fake_payload)
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} OOW ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'ttl_bracket' {
+				$if !windows {
+					parts := rule.l3_val.split(':')
+					if parts.len == 2 {
+						min_ttl := parse_int_or_hex(parts[0])
+						max_ttl := parse_int_or_hex(parts[1])
+						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+						seq, seq_ok := get_tcp_seq(fd)
+						if !seq_ok { continue }
+						fake_payload := gen_fake_payload(data.len, 0)
+						mut sent := 0
+						for t in min_ttl .. (max_ttl + 1) {
+							pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(t), fake_payload)
+							if send_raw_packet(dst_ip, dst_port, pkt) { sent++ }
+							time.sleep(200 * time.microsecond)
+						}
+						if verbose {
+							println('  ${term.green("[L3R]")} TTL_BRACKET [${min_ttl}-${max_ttl}] sent=${sent}')
+						}
+						time.sleep(1 * time.millisecond)
+					}
+				}
+			}
+			'win0' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok { continue }
+					fake_payload := gen_fake_payload(data.len, 404)
+					mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
+					pkt[34] = 0x00
+					pkt[35] = 0x00
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} WIN=0 TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'syn_in_win' {
+				$if !windows {
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok { continue }
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + 10, 0, 0x02, 64,[]u8{})
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} SYN_IN_WIN ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'fin_oow' {
+				$if !windows {
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok { continue }
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + 100000, 0, 0x11, 64,[]u8{})
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} FIN_OOW ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
+			'urg_desync' {
+				$if !windows {
+					ttl := parse_int_or_hex(rule.l3_val)
+					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+					seq, seq_ok := get_tcp_seq(fd)
+					if !seq_ok { continue }
+					fake_payload := gen_fake_payload(data.len, 99)
+					mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x38, u8(ttl), fake_payload)
+					pkt[38] = 0xFF
+					pkt[39] = 0xFF
+					ok := send_raw_packet(dst_ip, dst_port, pkt)
+					if verbose {
+						println('  ${term.green("[L3R]")} URG_DESYNC TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
+					}
+					time.sleep(1 * time.millisecond)
+				}
+			}
 			'fake' {
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.gray("[L3R]")} FAKE skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 0)
-					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0,
-						0x18, u8(ttl), fake_payload)
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.gray("[L3R]")} FAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} FAKE TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1196,17 +1306,13 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.red("[L3R]")} FAKETS skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 7)
-					pkt := build_raw_tcp_ex(src_ip, dst_ip, src_port, dst_port, seq,
-						0, 0x18, u8(ttl), fake_payload, true)
+					pkt := build_raw_tcp_ex(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, u8(ttl), fake_payload, true)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.gray("[L3R]")} FAKETS TTL=${ttl} (with TCP timestamp) ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} FAKETS TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1217,16 +1323,12 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.red("[L3R]")} RST skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
-					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0,
-						0x04, u8(ttl),[]u8{})
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x04, u8(ttl),[]u8{})
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.gray("[L3R]")} RST TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} RST TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1235,11 +1337,9 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					oob_data := hex.decode(rule.l3_val) or { continue }
 					if oob_data.len > 0 {
-						res := unsafe {
-							C.send(fd, voidptr(oob_data.data), oob_data.len, 1)
-						}
+						res := unsafe { C.send(fd, voidptr(oob_data.data), oob_data.len, 1) }
 						if verbose {
-							println('  ${term.gray("[L3R]")} OOB ${if res > 0 { 'OK' } else { 'FAIL' }}')
+							println('  ${term.gray("[L3R]")} OOB ${if res > 0 { "OK" } else { "FAIL" }}')
 						}
 						time.sleep(1 * time.millisecond)
 					}
@@ -1251,17 +1351,13 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					_, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.red("[L3R]")} SPOOF skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 13)
-					pkt := build_raw_tcp(spoof_ip, dst_ip, src_port, dst_port, seq, 0,
-						0x18, 64, fake_payload)
+					pkt := build_raw_tcp(spoof_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 64, fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.gray("[L3R]")} SPOOF src=${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} SPOOF ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1274,11 +1370,10 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					if !seq_ok {
 						continue
 					}
-					pkt := build_raw_tcp(spoof_ip, dst_ip, src_port, dst_port, seq, 0,
-						0x04, 64,[]u8{})
+					pkt := build_raw_tcp(spoof_ip, dst_ip, src_port, dst_port, seq, 0, 0x04, 64,[]u8{})
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.gray("[L3R]")} SPOOFED RST from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.gray("[L3R]")} SPOOFED RST ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1289,14 +1384,10 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.red("[L3R]")} IPFRAG skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 3)
-					full_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq,
-						0, 0x18, 3, fake_payload)
+					full_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 3, fake_payload)
 					fragments := build_ip_fragments(full_pkt, frag_size)
 					mut sent := 0
 					for frag in fragments {
@@ -1305,7 +1396,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						}
 					}
 					if verbose {
-						println('  ${term.gray("[L3R]")} IPFRAG: ${fragments.len} frags (${frag_size}B), sent=${sent}')
+						println('  ${term.gray("[L3R]")} IPFRAG: ${fragments.len} frags sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1319,8 +1410,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 5)
-					full_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq,
-						0, 0x18, 3, fake_payload)
+					full_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 3, fake_payload)
 					fragments := build_reversed_fragments(full_pkt, frag_size)
 					mut sent := 0
 					for frag in fragments {
@@ -1330,7 +1420,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						time.sleep(500 * time.microsecond)
 					}
 					if verbose {
-						println('  ${term.gray("[L3R]")} REVFRAG: ${fragments.len} reversed frags, sent=${sent}')
+						println('  ${term.gray("[L3R]")} REVFRAG: ${fragments.len} frags sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1341,9 +1431,6 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.red("[L3R]")} MULTIFAKE skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
 					mut sent := 0
@@ -1351,8 +1438,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					for fi in 0 .. count {
 						ttl := u8((t + u64(fi)) % 4 + 1)
 						fake_payload := gen_fake_payload(data.len, fi)
-						pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq,
-							0, 0x18, ttl, fake_payload)
+						pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, ttl, fake_payload)
 						if send_raw_packet(dst_ip, dst_port, pkt) {
 							sent++
 						}
@@ -1367,9 +1453,6 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					parts := rule.l3_val.split(':')
 					if parts.len != 2 {
-						if verbose {
-							println('  ${term.green("[L3R]")} SPOOFFRAG syntax: spooffrag=IP:fragsize')
-						}
 						continue
 					}
 					spoof_ip := parse_spoof_ip(parts[0])
@@ -1380,8 +1463,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 9)
-					full_pkt := build_raw_tcp(spoof_ip, dst_ip, src_port, dst_port, seq,
-						0, 0x18, 64, fake_payload)
+					full_pkt := build_raw_tcp(spoof_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 64, fake_payload)
 					fragments := build_ip_fragments(full_pkt, frag_size)
 					mut sent := 0
 					for frag in fragments {
@@ -1390,7 +1472,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						}
 					}
 					if verbose {
-						println('  ${term.green("[L3R]")} SPOOFFRAG: ${fragments.len} frags from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]}, sent=${sent}')
+						println('  ${term.green("[L3R]")} SPOOFFRAG: ${fragments.len} frags sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1403,16 +1485,11 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					if !seq_ok {
 						continue
 					}
-					fake_payload := gen_fake_payload(if data.len > 64 {
-						64
-					} else {
-						data.len
-					}, 11)
-					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq - 1,
-						0, 0x02, u8(ttl), fake_payload)
+					fake_payload := gen_fake_payload(if data.len > 64 { 64 } else { data.len }, 11)
+					pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq - 1, 0, 0x02, u8(ttl), fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.green("[L3R]")} SYNFAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} SYNFAKE TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1424,13 +1501,9 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 						seq, seq_ok := get_tcp_seq(fd)
 						if !seq_ok {
-							if verbose {
-								println('  ${term.red("[L3R]")} DISORDER skipped')
-							}
 							continue
 						}
-						pkt2 := build_raw_tcp(src_ip, dst_ip, src_port, dst_port,
-							seq + u32(pos), 0, 0x18, 64, data[pos..])
+						pkt2 := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + u32(pos), 0, 0x18, 64, data[pos..])
 						send_raw_packet(dst_ip, dst_port, pkt2)
 						time.sleep(1 * time.millisecond)
 						conn.write(data[..pos]) or { return false }
@@ -1447,19 +1520,15 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok {
-						if verbose {
-							println('  ${term.red("[L3R]")} BADCSUM skipped: TCP_REPAIR failed')
-						}
 						continue
 					}
 					fake_payload := gen_fake_payload(data.len, 15)
 					mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x18, 64, fake_payload)
 					pkt[36] = ~pkt[36]
 					pkt[37] = ~pkt[37]
-					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.green("[L3R]")} BADCSUM sent ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} BADCSUM ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1469,14 +1538,12 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
 					seq, seq_ok := get_tcp_seq(fd)
 					if !seq_ok { continue }
-					
 					mut pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq, 0, 0x11, 64,[]u8{})
 					pkt[36] = ~pkt[36]
 					pkt[37] = ~pkt[37]
-					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.green("[L3R]")} FAKE TEARDOWN (FIN) sent ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} FAKETEARDOWN ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1485,13 +1552,11 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 0)
 					pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, u8(ttl), fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
-					
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP FAKE TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP_FAKE TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1500,16 +1565,13 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 15)
 					mut pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, u8(ttl), fake_payload)
-					
 					pkt[26] = ~pkt[26]
 					pkt[27] = ~pkt[27]
-					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP BADCSUM TTL=${ttl} sent ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP_BADCSUM TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1518,16 +1580,13 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 16)
 					mut pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, u8(ttl), fake_payload)
-					
 					pkt[26] = 0x00
 					pkt[27] = 0x00
-					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP ZEROCSUM TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP_ZEROCSUM TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1536,13 +1595,11 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					spoof_ip := parse_spoof_ip(rule.l3_val)
 					_, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 13)
 					pkt := build_raw_udp(spoof_ip, dst_ip, src_port, dst_port, 64, fake_payload)
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
-					
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP SPOOF src=${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP_SPOOF ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1551,11 +1608,9 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					frag_size := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 3)
 					full_pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, 3, fake_payload)
 					fragments := build_ip_fragments(full_pkt, frag_size)
-					
 					mut sent := 0
 					for frag in fragments {
 						if send_raw_packet(dst_ip, dst_port, frag) {
@@ -1563,7 +1618,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						}
 					}
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP IPFRAG: ${fragments.len} frags (${frag_size}B), sent=${sent}')
+						println('  ${term.green("[L3R]")} UDP_IPFRAG sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1572,11 +1627,9 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					frag_size := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 5)
 					full_pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, 3, fake_payload)
 					fragments := build_reversed_fragments(full_pkt, frag_size)
-					
 					mut sent := 0
 					for frag in fragments {
 						if send_raw_packet(dst_ip, dst_port, frag) {
@@ -1585,7 +1638,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						time.sleep(500 * time.microsecond)
 					}
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP REVFRAG: ${fragments.len} reversed frags, sent=${sent}')
+						println('  ${term.green("[L3R]")} UDP_REVFRAG sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1594,20 +1647,18 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					count := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					mut sent := 0
 					t := u64(time.now().unix_milli())
 					for fi in 0 .. count {
 						ttl := u8((t + u64(fi)) % 4 + 1)
 						fake_payload := gen_fake_payload(data.len, fi)
-						
 						pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, ttl, fake_payload)
 						if send_raw_packet(dst_ip, dst_port, pkt) {
 							sent++
 						}
 					}
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP MULTIFAKE: ${sent}/${count} sent')
+						println('  ${term.green("[L3R]")} UDP_MULTIFAKE sent=${sent}/${count}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1616,19 +1667,14 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					parts := rule.l3_val.split(':')
 					if parts.len != 2 {
-						if verbose {
-							println('  ${term.green("[L3R]")} UDP SPOOFFRAG syntax: spooffrag=IP:fragsize')
-						}
 						continue
 					}
 					spoof_ip := parse_spoof_ip(parts[0])
 					frag_size := parse_int_or_hex(parts[1])
 					_, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 9)
 					full_pkt := build_raw_udp(spoof_ip, dst_ip, src_port, dst_port, 64, fake_payload)
 					fragments := build_ip_fragments(full_pkt, frag_size)
-					
 					mut sent := 0
 					for frag in fragments {
 						if send_raw_packet(dst_ip, dst_port, frag) {
@@ -1636,7 +1682,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						}
 					}
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP SPOOFFRAG: ${fragments.len} frags from ${spoof_ip[0]}.${spoof_ip[1]}.${spoof_ip[2]}.${spoof_ip[3]}, sent=${sent}')
+						println('  ${term.green("[L3R]")} UDP_SPOOFFRAG sent=${sent}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1645,17 +1691,14 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
 					src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-					
 					fake_payload := gen_fake_payload(data.len, 17)
 					mut pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, u8(ttl), fake_payload)
-					
 					bad_len := u16(9999) 
 					pkt[24] = u8(bad_len >> 8)
 					pkt[25] = u8(bad_len & 0xFF)
-					
 					ok := send_raw_packet(dst_ip, dst_port, pkt)
 					if verbose {
-						println('  ${term.green("[L3R]")} UDP BADLENGTH TTL=${ttl} ${if ok { 'OK' } else { 'FAIL' }}')
+						println('  ${term.green("[L3R]")} UDP_BADLENGTH TTL=${ttl} ${if ok { "OK" } else { "FAIL" }}')
 					}
 					time.sleep(1 * time.millisecond)
 				}
@@ -1663,7 +1706,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 			else {}
 		}
 	}
-	
+
 	for rule in script {
 		if rule.mode != 'l3r' {
 			continue
@@ -1677,6 +1720,38 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					conn.write(data[offset..]) or { return false }
 					if verbose {
 						println('  ${term.green("[L3R]")} SPLITSNI at ${offset}')
+					}
+					return true
+				}
+			}
+			'splitsni_oow' {
+				offset := find_sni_middle_offset(data)
+				if offset > 0 {
+					conn.write(data[..offset]) or { return false }
+					time.sleep(2 * time.millisecond)
+					$if !windows {
+						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+						seq, seq_ok := get_tcp_seq(fd)
+						if seq_ok {
+							fake_pkt := build_raw_tcp(src_ip, dst_ip, src_port, dst_port, seq + 100000, 0, 0x18, 64, "youtube.com".bytes())
+							send_raw_packet(dst_ip, dst_port, fake_pkt)
+						}
+					}
+					conn.write(data[offset..]) or { return false }
+					if verbose {
+						println('  ${term.green("[L3R]")} SPLITSNI_OOW at ${offset}')
+					}
+					return true
+				}
+			}
+			'splitsni_delay' {
+				offset := find_sni_middle_offset(data)
+				if offset > 0 {
+					conn.write(data[..offset]) or { return false }
+					time.sleep(15 * time.millisecond) 
+					conn.write(data[offset..]) or { return false }
+					if verbose {
+						println('  ${term.green("[L3R]")} SPLITSNI_DELAY at ${offset}')
 					}
 					return true
 				}
@@ -1703,7 +1778,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					time.sleep(2 * time.millisecond)
 					conn.write(data[1..]) or { return false }
 					if verbose {
-						println('  ${term.green("[L3R]")} SPLIT1 (Bypass 1st byte inspector)')
+						println('  ${term.green("[L3R]")} SPLIT1')
 					}
 					return true
 				}
@@ -1715,7 +1790,19 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					time.sleep(1 * time.millisecond)
 					conn.write(data[pos..]) or { return false }
 					if verbose {
-						println('  ${term.green("[L3R]")} SPLIT at ${pos}: ${pos}+${data.len - pos}')
+						println('  ${term.green("[L3R]")} SPLIT at ${pos}')
+					}
+					return true
+				}
+			}
+			'split_mid' {
+				if data.len > 2 {
+					pos := data.len / 2
+					conn.write(data[..pos]) or { return false }
+					time.sleep(2 * time.millisecond)
+					conn.write(data[pos..]) or { return false }
+					if verbose {
+						println('  ${term.green("[L3R]")} SPLIT_MID at ${pos}')
 					}
 					return true
 				}
@@ -1736,7 +1823,7 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 						}
 					}
 					if verbose {
-						println('  ${term.green("[L3R]")} SEG: ${seg_size}-byte chunks')
+						println('  ${term.green("[L3R]")} SEG: ${seg_size}')
 					}
 					return true
 				}
@@ -1746,17 +1833,14 @@ fn desync_write(mut conn net.TcpConn, data[]u8, script[]Rule, verbose bool) bool
 					pos := parse_int_or_hex(rule.l3_val)
 					if pos > 0 && pos < data.len {
 						src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
-						
 						full_pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, 64, data)
 						fragments := build_ip_fragments(full_pkt, pos) 
-						
 						for frag in fragments {
 							send_raw_packet(dst_ip, dst_port, frag)
 							time.sleep(500 * time.microsecond)
 						}
-						
 						if verbose {
-							println('  ${term.green("[L3R]")} UDP TAIL/FRAG at ${pos}: ${pos}+${data.len - pos}')
+							println('  ${term.green("[L3R]")} UDP_TAIL at ${pos}')
 						}
 						return true 
 					}

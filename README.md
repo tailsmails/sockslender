@@ -69,17 +69,25 @@ Requires `root` or `CAP_NET_RAW` + `CAP_NET_ADMIN`.
 | Rule | Root | Description |
 |---|---|---|
 | `split=N` / `seg=N` | No | Split first packet at byte N, or segment entire payload. |
+| `split1` / `split_mid` | No | Split after the 1st byte, or exactly in the middle of the payload. |
 | `splitsni` / `splithttp` | No | Auto-detect and split exactly at SNI or HTTP Host boundary. |
+| `splitsni_delay` | No | Split at SNI boundary with a 15ms delay to overflow DPI buffers. |
+| `splitsni_oow` | Yes | Split at SNI and inject an Out-Of-Window fake packet in between. |
 | `oob=HEX` | No | Send TCP Out-of-Band (urgent) data. |
 | `fake=TTL` / `fakets=TTL` | Yes | Fake packet (with/without TCP timestamp) with low TTL. |
 | `hoax=TTL` / `overlap=TTL`| Yes | Fake HTTP GET payload, or overlapping fake payload. |
+| `overlap1byte` | Yes | 1-byte overlapping fake payload (`Seq-1`) to confuse DPI TCP reassembly. |
+| `oow` / `fin_oow` | Yes | Send Out-Of-Window fake payload or FIN packet (`Seq+1M`) to desync state. |
+| `synfake=TTL` / `syn_in_win` | Yes | Send a SYN packet (`Seq-1`) or in-window SYN to reset DPI state. |
 | `rst=TTL` / `faketeardown` | Yes | Fake TCP RST or FIN packet with low TTL. |
 | `disorder=N` | Yes | Send second half of the packet before the first half. |
+| `ttl_bracket=MIN:MAX` | Yes | Bombard DPI with fake packets across a TTL range (e.g., `3:8`). |
+| `win0=TTL` | Yes | Send fake packet with TCP Window Size set to 0 to freeze DPI buffer. |
+| `urg_desync=TTL` | Yes | Send fake payload with TCP URG (Urgent) flag enabled. |
 | `ipfrag=N` / `revfrag=N` | Yes | Fragment fake packet at IP level (forward or reverse order). |
 | `spoof=IP` / `spoofrst=IP` | Yes | Inject fake payload or RST using a forged source IP (`random`). |
 | `spooffrag=IP:N` | Yes | IP spoofing combined with IP fragmentation (`random:16`). |
 | `multifake=N` | Yes | Flood N fake packets with varying low TTLs (1-4). |
-| `synfake=TTL` | Yes | Send a SYN packet (Seq-1) carrying payload data. |
 | `badcsum` | Yes | Send fake payload with an intentionally invalid TCP checksum. |
 
 ### L3R: UDP Raw Socket DPI Desync (Linux)
@@ -93,6 +101,7 @@ Unique UDP-specific bypass techniques for protocols like QUIC or DNS.
 | `udpbadlength=TTL` | Send UDP packet with intentionally corrupt length header. |
 | `udpspoof=IP` | Forged UDP source IP injection. |
 | `udpipfrag=N` / `udprevfrag=N` | Fragment UDP payload at IP level (forward/reverse). |
+| `udpspooffrag=IP:N` | Forged UDP source IP combined with IP fragmentation. |
 | `udpmultifake=N` | Flood N fake UDP packets with varying low TTLs. |
 | `udptail=N` | Extract and fragment the tail of the real UDP packet. |
 
