@@ -3573,120 +3573,96 @@ fn tcp_udp_monitor(mut client net.TcpConn, mut relay_conn net.UdpConn, mut out n
 	out.close() or {}
 }
 
+fn check_internet_via_node(n Node) bool {
+	match n.proto {
+		.socks5 { return check_socks5_h(n) }
+		.http   { return check_http_h(n) }
+		.sni    { return check_tcp_h(n.addr) } 
+		.dns    { return check_dns_h(n) }
+	}
+	return false
+}
+
 fn watchdog_loop(mut wd Watchdog) {
 	for {
 		time.sleep(15 * time.second)
+
 		wd.mu.@lock()
 		count := wd.procs.len
 		wd.mu.unlock()
+
 		for idx in 0 .. count {
 			wd.mu.@lock()
 			if idx >= wd.procs.len {
 				wd.mu.unlock()
 				break
 			}
-			cmd := wd.procs[idx].cmd
-			args := wd.procs[idx].args.clone()
-			check_node := wd.procs[idx].check_node
-			last_restart := wd.procs[idx].last_restart
-			rc := wd.procs[idx].restart_count
-			proc_alive := wd.procs[idx].proc.is_alive()
-			conf_path := wd.procs[idx].conf_path
+			
+			mut p_item := wd.procs[idx]
+			cmd := p_item.cmd
+			args := p_item.args.clone()
+			check_node := p_item.check_node
+			last_restart := p_item.last_restart
+			rc := p_item.restart_count
+			proc_alive := p_item.proc.is_alive()
 			wd.mu.unlock()
-
+			
 			mut cooldown_secs := i64(30)
 			for _ in 0 .. rc {
 				cooldown_secs *= 2
-				if cooldown_secs > 300 {
-					cooldown_secs = 300
-					break
-				}
+				if cooldown_secs > 300 { cooldown_secs = 300; break }
 			}
 			if time.now() - last_restart < cooldown_secs * time.second {
 				continue
 			}
-
+			
 			mut alive := true
 			if !proc_alive {
 				alive = false
 			} else {
-				temp_chain := Chain{
-					nodes: [check_node]
-					alive: true
-				}
-				if temp_chain.nodes.len > 0 {
-					n := temp_chain.nodes[0]
-					match n.proto {
-						.socks5 { alive = check_socks5_h(n) }
-						.http { alive = check_http_h(n) }
-						.sni { alive = check_tcp_h(n.addr) }
-						.dns { alive = check_dns_h(n) }
-					}
-				} else {
-					alive = false
+				match check_node.proto {
+					.socks5 { alive = check_socks5_h(check_node) }
+					.http   { alive = check_http_h(check_node) }
+					.sni    { alive = check_tcp_h(check_node.addr) }
+					.dns    { alive = check_dns_h(check_node) }
 				}
 			}
-
 			if alive {
 				if rc > 0 {
 					wd.mu.@lock()
-					if idx < wd.procs.len {
-						wd.procs[idx].restart_count = 0
-					}
+					if idx < wd.procs.len { wd.procs[idx].restart_count = 0 }
 					wd.mu.unlock()
 				}
 				continue
 			}
-
 			wd.mu.@lock()
 			if idx >= wd.procs.len {
 				wd.mu.unlock()
 				break
 			}
+			
 			new_rc := wd.procs[idx].restart_count + 1
-			pname := match check_node.proto {
-				.socks5 { 'SOCKS5' }
-				.http { 'HTTP' }
-				.dns { 'DNS' }
-				.sni { 'TCP' }
-			}
+			
 			if proc_alive {
-				println('\n${term.red("[!]")} [Watchdog] FREEZE DETECTED: "${cmd}" alive but ${pname} handshake failed at ${check_node.addr} (restart #${new_rc})')
+				println('\n${term.red("[!]")} [Watchdog] NO INTERNET: "${cmd}" is running but cannot reach 1.1.1.1 (Restart #${new_rc})')
 			} else {
-				println('\n${term.red("[!]")} [Watchdog] CRASH DETECTED: "${cmd}" is dead (restart #${new_rc})')
+				println('\n${term.red("[!]")} [Watchdog] CRASH: "${cmd}" died (Restart #${new_rc})')
 			}
 			if wd.procs[idx].proc.is_alive() {
 				wd.procs[idx].proc.signal_kill()
 			}
 			wd.procs[idx].proc.wait()
 			wd.procs[idx].proc.close()
-
 			mut new_p := os.new_process(cmd)
-			new_args := args.clone()
-			if new_args.len > 0 {
-				new_p.set_args(new_args)
+			if args.len > 0 {
+				new_p.set_args(args)
 			}
 			new_p.run()
 			wd.procs[idx].proc = new_p
 			wd.procs[idx].last_restart = time.now()
 			wd.procs[idx].restart_count = new_rc
-
-			mut next_cd := i64(30)
-			for _ in 0 .. new_rc {
-				next_cd *= 2
-				if next_cd > 120 {
-					next_cd = 120
-					break
-				}
-			}
-			if conf_path != '' {
-				println('    -> Restarted via proxychains (PID: ${new_p.pid}). Next check in ${next_cd}s.')
-			} else {
-				println('    -> Restarted (PID: ${new_p.pid}). Next check in ${next_cd}s.')
-			}
-			if new_rc >= 5 {
-				println('    ${term.red("[!]")} WARNING: "${cmd}" restarted ${new_rc} times!')
-			}
+			
+			println('    -> Restarted (PID: ${new_p.pid}). Waiting ${cooldown_secs}s for next check.')
 			wd.mu.unlock()
 		}
 	}
