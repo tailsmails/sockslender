@@ -371,6 +371,12 @@ struct Node {
 	script[]Rule
 }
 
+struct ChainStats {
+mut:
+	successes f64
+	trials    f64
+}
+
 struct Chain {
 mut:
 	nodes[]Node
@@ -409,6 +415,11 @@ mut:
 	hedge_delay time.Duration
 	sock_mon   SocketMonitor
 	active_conns map[int]&ManagedConnection
+	
+	stats        []ChainStats
+	total_trials f64
+	
+	mu_shared         shared sync.Mutex
 }
 
 struct HedgeResult {
@@ -2849,31 +2860,56 @@ fn pick_chain_order(mut app App)[]int {
 	return idxs
 }
 
-fn pick_best_from_list(mut app App, allowed_idxs []int)[]int {
-	app.mu.@lock()
-	defer { app.mu.unlock() }
-	mut alive_idxs :=[]int{cap: allowed_idxs.len}
-	for ci in allowed_idxs {
-		if ci < app.chains.len && app.chains[ci].alive { alive_idxs << ci }
-	}
-	if alive_idxs.len == 0 { return allowed_idxs.clone() }
-	if alive_idxs.len == 1 { return alive_idxs }
-	
-	mut scores :=[]f64{len: alive_idxs.len}
-	for i, ci in alive_idxs {
-		base_score := calc_chain_score(app.chains[ci])
-		jitter := 1.0 + (rand.f64() * 0.1 - 0.05)
-		scores[i] = base_score * jitter
-	}
-	for i in 1 .. alive_idxs.len {
-		mut j := i
-		for j > 0 && scores[j] > scores[j - 1] {
-			alive_idxs[j], alive_idxs[j - 1] = alive_idxs[j - 1], alive_idxs[j]
-			scores[j], scores[j - 1] = scores[j - 1], scores[j]
-			j--
+fn (mut app App) update_chain_stats(ci int, success bool) {
+	lock app.mu_shared {
+		if ci < app.stats.len {
+			app.stats[ci].trials++
+			if success {
+				app.stats[ci].successes++
+			}
+			app.total_trials++
 		}
 	}
-	return alive_idxs
+}
+
+fn pick_best_from_list(mut app App, allowed_idxs []int) []int {
+	lock app.mu_shared {
+		mut alive_idxs := []int{cap: allowed_idxs.len}
+		for ci in allowed_idxs {
+			if ci < app.chains.len && app.chains[ci].alive {
+				alive_idxs << ci
+			}
+		}
+
+		if alive_idxs.len == 0 {
+			return allowed_idxs.clone()
+		}
+		if alive_idxs.len == 1 {
+			return alive_idxs
+		}
+
+		mut scores := []f64{len: alive_idxs.len}
+		for i, ci in alive_idxs {
+			stat := app.stats[ci]
+			if stat.trials < 1 {
+				scores[i] = 1e9
+			} else {
+				exploitation := stat.successes / stat.trials
+				exploration := math.sqrt(2.0 * math.log(app.total_trials) / stat.trials)
+				scores[i] = exploitation + exploration
+			}
+		}
+
+		for i in 1 .. alive_idxs.len {
+			mut j := i
+			for j > 0 && scores[j] > scores[j - 1] {
+				alive_idxs[j], alive_idxs[j - 1] = alive_idxs[j - 1], alive_idxs[j]
+				scores[j], scores[j - 1] = scores[j - 1], scores[j]
+				j--
+			}
+		}
+		return alive_idxs
+	}
 }
 
 fn connect_retry(mut app App, host string, port int, l Listener) !(&net.TcpConn,[]Rule) {
