@@ -1155,6 +1155,17 @@ fn desync_write(mut conn net.TcpConn, data []u8, script []Rule, verbose bool) bo
 			'domain' {
 				fake_domain = rule.l3_val
 			}
+			'udp_rev_frag' {
+    			$if !windows {
+        			src_ip, src_port, dst_ip, dst_port := get_sock_info(fd)
+        			full_pkt := build_raw_udp(src_ip, dst_ip, src_port, dst_port, 64, data)
+        			fragments := build_reversed_fragments(full_pkt, 8)
+        			for frag in fragments {
+            			send_raw_packet(dst_ip, dst_port, frag)
+            			time.sleep(2 * time.microsecond)
+        			}
+    			}
+			}
 			'hoax' {
 				$if !windows {
 					ttl := parse_int_or_hex(rule.l3_val)
