@@ -41,6 +41,22 @@ mut:
 	byte_pool    []u8
 }
 
+fn try_recover(data []u8, expected_crc u32) ?[]u8 {
+	mut test_buf := data.clone()
+	for i in 0 .. test_buf.len {
+		old_byte := test_buf[i]
+		for b in 0 .. 256 {
+			if u8(b) == old_byte { continue }
+			test_buf[i] = u8(b)
+			if crc32.sum(test_buf) == expected_crc {
+				return test_buf
+			}
+		}
+		test_buf[i] = old_byte
+	}
+	return none
+}
+
 fn read_exact(mut conn net.TcpConn, n int) ![]u8 {
 	mut buf := []u8{len: n}
 	mut total := 0
@@ -87,18 +103,25 @@ fn extract_valid_frames(cfg Config, shared state AppState) []FrameData {
 			payload_len := int(binary.big_endian_u16(state.byte_pool[5..7]))
 			total_frame_len := header_len + payload_len + crc_len
 			if state.byte_pool.len < total_frame_len { break }
-			frame_without_crc := state.byte_pool[..total_frame_len - crc_len]
-			expected_crc := crc32.sum(frame_without_crc)
+			frame_part := state.byte_pool[..total_frame_len - crc_len].clone()
 			received_crc := binary.big_endian_u32(state.byte_pool[total_frame_len - crc_len..total_frame_len])
-			if expected_crc == received_crc {
-				cmd := state.byte_pool[2]
-				conn_id := state.byte_pool[3]
-				payload := state.byte_pool[header_len..header_len + payload_len].clone()
+			if crc32.sum(frame_part) == received_crc {
+				cmd := frame_part[2]
+				conn_id := frame_part[3]
+				payload := frame_part[header_len..].clone()
 				valid_frames << FrameData{cmd: cmd, conn_id: conn_id, payload: payload}
-				if cfg.verbose { println('[+] Valid Frame RX -> CMD: ${cmd}, ID: ${conn_id}, LEN: ${payload.len}') }
 				state.byte_pool.delete_many(0, total_frame_len)
 			} else {
-				state.byte_pool.delete(0)
+				if recovered := try_recover(frame_part, received_crc) {
+					if cfg.verbose { println('[!] Recovered Frame') }
+					cmd := recovered[2]
+					conn_id := recovered[3]
+					payload := recovered[header_len..].clone()
+					valid_frames << FrameData{cmd: cmd, conn_id: conn_id, payload: payload}
+					state.byte_pool.delete_many(0, total_frame_len)
+				} else {
+					state.byte_pool.delete(0)
+				}
 			}
 		}
 	}
@@ -110,16 +133,14 @@ fn execute_tx(cfg Config, data []u8, shared state AppState) {
 	cmd := '${cfg.adapter_cmd} tx ${b64_str}'
 	lock state {
 		res := os.execute(cmd)
-		if res.exit_code != 0 && cfg.verbose { eprintln('[!] TX Failed: ${res.output}') }
+		if res.exit_code != 0 && cfg.verbose { eprintln('[!] TX Failed') }
 	}
 }
 
 fn execute_rx(cfg Config, shared state AppState) []u8 {
 	cmd := '${cfg.adapter_cmd} rx'
 	mut res := os.Result{}
-	lock state {
-		res = os.execute(cmd)
-	}
+	lock state { res = os.execute(cmd) }
 	mut all_bytes := []u8{}
 	if res.exit_code == 0 && res.output.trim_space() != '' {
 		lines := res.output.trim_space().split('\n')
@@ -156,9 +177,7 @@ fn client_worker(cfg Config, mut client net.TcpConn, shared state AppState) {
 		dom_port := read_exact(mut client, dl + 2) or { return }
 		host = dom_port[..dl].bytestr()
 		port = (u16(dom_port[dl]) << 8) | u16(dom_port[dl+1])
-	} else {
-		return
-	}
+	} else { return }
 	mut conn_id := u8(0)
 	lock state {
 		conn_id = state.next_id
@@ -167,7 +186,6 @@ fn client_worker(cfg Config, mut client net.TcpConn, shared state AppState) {
 		state.conn_ready[conn_id] = false
 		state.conn_failed[conn_id] = false
 	}
-	if cfg.verbose { println('[*] Client [ID:${conn_id}] requested: ${host}:${port}') }
 	target_str := '${host}:${port}'
 	frame := build_frame(cmd_connect, conn_id, target_str.bytes(), shared state)
 	execute_tx(cfg, frame, shared state)
@@ -182,12 +200,10 @@ fn client_worker(cfg Config, mut client net.TcpConn, shared state AppState) {
 		time.sleep(100 * time.millisecond)
 	}
 	if has_failed || !is_ready {
-		if cfg.verbose { println('[-] SOCKS [ID:${conn_id}] Upstream connection failed.') }
 		client.write([u8(0x05), 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) or {}
 		client.close() or {}
 		return
 	}
-	if cfg.verbose { println('[+] SOCKS [ID:${conn_id}] Upstream OK!') }
 	client.write([u8(0x05), 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]) or {}
 	mut read_buf := []u8{len: cfg.chunk_size}
 	for {
@@ -198,7 +214,6 @@ fn client_worker(cfg Config, mut client net.TcpConn, shared state AppState) {
 	}
 	client.close() or {}
 	lock state { state.conns.delete(conn_id) }
-	if cfg.verbose { println('[*] Client [ID:${conn_id}] disconnected.') }
 }
 
 fn client_rx_loop(cfg Config, shared state AppState) {
@@ -227,7 +242,6 @@ fn client_rx_loop(cfg Config, shared state AppState) {
 }
 
 fn server_worker(cfg Config, shared state AppState) {
-	if cfg.verbose { println('[*] Server listening to Side-Channel...') }
 	for {
 		time.sleep(cfg.poll_delay * time.millisecond)
 		raw_bytes := execute_rx(cfg, shared state)
@@ -240,9 +254,7 @@ fn server_worker(cfg Config, shared state AppState) {
 		for frame in frames {
 			if frame.cmd == cmd_connect {
 				target := frame.payload.bytestr()
-				if cfg.verbose { println('[+] Connect request [ID:${frame.conn_id}] for: ${target}') }
 				mut up_conn := net.dial_tcp(target) or {
-					if cfg.verbose { eprintln('[-] Dial failed for [ID:${frame.conn_id}]') }
 					err_frame := build_frame(cmd_connect_err, frame.conn_id, [], shared state)
 					execute_tx(cfg, err_frame, shared state)
 					continue
@@ -250,18 +262,13 @@ fn server_worker(cfg Config, shared state AppState) {
 				up_conn.set_read_timeout(5 * time.minute)
 				up_conn.set_write_timeout(5 * time.minute)
 				lock state { state.conns[frame.conn_id] = up_conn }
-				if cfg.verbose { println('[+] Connected upstream for [ID:${frame.conn_id}]') }
 				ok_frame := build_frame(cmd_connect_ok, frame.conn_id, [], shared state)
 				execute_tx(cfg, ok_frame, shared state)
 				spawn server_tx_loop(cfg, frame.conn_id, shared state)
 			} else if frame.cmd == cmd_data {
 				mut up_conn := &net.TcpConn(unsafe { nil })
-				lock state {
-					up_conn = state.conns[frame.conn_id] or { unsafe { nil } }
-				}
-				if up_conn != unsafe { nil } {
-					up_conn.write(frame.payload) or {}
-				}
+				lock state { up_conn = state.conns[frame.conn_id] or { unsafe { nil } } }
+				if up_conn != unsafe { nil } { up_conn.write(frame.payload) or {} }
 			}
 		}
 	}
@@ -270,9 +277,7 @@ fn server_worker(cfg Config, shared state AppState) {
 fn server_tx_loop(cfg Config, conn_id u8, shared state AppState) {
 	mut buf := []u8{len: cfg.chunk_size}
 	mut upstream := &net.TcpConn(unsafe { nil })
-	lock state { 
-		upstream = state.conns[conn_id] or { unsafe { nil } }
-	}
+	lock state { upstream = state.conns[conn_id] or { unsafe { nil } } }
 	if upstream == unsafe { nil } { return }
 	for {
 		nr := upstream.read(mut buf) or { break }
@@ -282,7 +287,6 @@ fn server_tx_loop(cfg Config, conn_id u8, shared state AppState) {
 	}
 	upstream.close() or {}
 	lock state { state.conns.delete(conn_id) }
-	if cfg.verbose { println('[*] Upstream [ID:${conn_id}] closed.') }
 }
 
 fn main() {
@@ -295,7 +299,7 @@ fn main() {
 	dly  := fp.int('delay', `d`, 50, 'Polling delay')
 	vrb  := fp.bool('verbose', `v`, false, 'Verbose')
 	fp.finalize() or { return }
-	if cmd == '' { eprintln('Specify adapter with -e'); return }
+	if cmd == '' { return }
 	cfg := Config{mode, addr, cmd, chk, dly, vrb}
 	shared state := AppState{
 		conns: map[u8]&net.TcpConn{}
@@ -307,8 +311,7 @@ fn main() {
 	if mode == 'server' {
 		server_worker(cfg, shared state)
 	} else {
-		mut listener := net.listen_tcp(.ip, addr) or { eprintln('Bind error'); return }
-		if cfg.verbose { println('[*] Client listening on ${addr}') }
+		mut listener := net.listen_tcp(.ip, addr) or { return }
 		spawn client_rx_loop(cfg, shared state)
 		for {
 			mut client := listener.accept() or { continue }
