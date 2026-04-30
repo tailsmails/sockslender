@@ -340,6 +340,7 @@ mut:
 	restart_count int
 	variations    []string
 	experiences   map[string]ConfigExperience
+	nn NeuralNetwork
 }
 
 struct Watchdog {
@@ -3625,19 +3626,98 @@ fn check_internet_via_node(n Node) bool {
 	return false
 }
 
-fn (mut p ManagedProcess) select_best_config() string {
-	if rand.f64() < 0.15 || p.experiences.len < p.variations.len {
-		for v in p.variations {
-			if v !in p.experiences { return v }
+struct NeuralNetwork {
+mut:
+	w1 [][]f64
+	b1 []f64
+	w2 [][]f64
+	b2 []f64
+	lr f64
+	is_init bool
+}
+
+fn (mut nn NeuralNetwork) ensure_init() {
+	if nn.is_init { return }
+	
+	nn.lr = 0.5
+	input_nodes := 2
+	hidden_nodes := 3
+	output_nodes := 1
+	
+	nn.w1 = [][]f64{len: input_nodes, init: []f64{len: hidden_nodes}}
+	for i in 0 .. input_nodes {
+		for j in 0 .. hidden_nodes { nn.w1[i][j] = rand.f64() }
+	}
+
+	nn.b1 = []f64{len: hidden_nodes, init: rand.f64()}
+	nn.w2 = [][]f64{len: hidden_nodes, init: []f64{len: output_nodes}}
+	for i in 0 .. hidden_nodes {
+		for j in 0 .. output_nodes { nn.w2[i][j] = rand.f64() }
+	}
+	
+	nn.b2 = []f64{len: output_nodes, init: rand.f64()}
+	nn.is_init = true
+}
+
+fn (mut nn NeuralNetwork) predict(inputs []f64) f64 {
+	nn.ensure_init()
+	
+	mut h_act := []f64{len: nn.b1.len}
+	for h in 0 .. nn.b1.len {
+		mut sum := nn.b1[h]
+		for j in 0 .. inputs.len { sum += inputs[j] * nn.w1[j][h] }
+		h_act[h] = 1.0 / (1.0 + math.exp(-sum))
+	}
+	mut out_sum := nn.b2[0]
+	for h in 0 .. nn.b1.len { out_sum += h_act[h] * nn.w2[h][0] }
+	return 1.0 / (1.0 + math.exp(-out_sum))
+}
+
+fn (mut nn NeuralNetwork) train_step(inputs []f64, target f64) {
+	nn.ensure_init()
+	
+	// Forward
+	mut h_act := []f64{len: nn.b1.len}
+	for h in 0 .. nn.b1.len {
+		mut sum := nn.b1[h]
+		for j in 0 .. inputs.len { sum += inputs[j] * nn.w1[j][h] }
+		h_act[h] = 1.0 / (1.0 + math.exp(-sum))
+	}
+	actual := 1.0 / (1.0 + math.exp(-(nn.b2[0] + h_act[0]*nn.w2[0][0] + h_act[1]*nn.w2[1][0] + h_act[2]*nn.w2[2][0])))
+	
+	// Backprop
+	output_error := target - actual
+	d_output := output_error * (actual * (1.0 - actual))
+
+	for h in 0 .. nn.b1.len {
+		err := d_output * nn.w2[h][0]
+		d_h := err * (h_act[h] * (1.0 - h_act[h]))
+		nn.w2[h][0] += nn.lr * d_output * h_act[h]
+		for j in 0 .. inputs.len {
+			nn.w1[j][h] += nn.lr * d_h * inputs[j]
 		}
+		nn.b1[h] += nn.lr * d_h
+	}
+	nn.b2[0] += nn.lr * d_output
+}
+
+fn (mut p ManagedProcess) select_best_config() string {
+	if p.variations.len == 0 { return p.current_cmd }
+	
+	if rand.f64() < 0.10 {
 		return rand.element(p.variations) or { p.current_cmd }
 	}
 	
 	mut best := p.current_cmd
-	mut max_s := -999999.0
-	for cfg, exp in p.experiences {
-		if exp.score > max_s {
-			max_s = exp.score
+	mut max_pred := -999.0
+	
+	for cfg in p.variations {
+		exp := p.experiences[cfg] or { ConfigExperience{} }
+		feat := [1.0 / (exp.latency + 1.0), f64(exp.success_count) / 100.0]
+		prediction := p.nn.predict(feat)
+		
+		if prediction > max_pred {
+			max_pred = prediction
 			best = cfg
 		}
 	}
@@ -3647,9 +3727,7 @@ fn (mut p ManagedProcess) select_best_config() string {
 fn watchdog_loop(mut wd Watchdog) {
 	for {
 		time.sleep(5 * time.second)
-		
 		for i in 0 .. wd.procs.len {
-			
 			mut p_item := &wd.procs[i]
 			is_alive_proc := p_item.proc.is_alive()
 			
@@ -3670,6 +3748,10 @@ fn watchdog_loop(mut wd Watchdog) {
 			lock wd.mu_shared {
 				mut exp := p_item.experiences[p_item.current_cmd] or { ConfigExperience{} }
 				
+				feat := [1.0 / (exp.latency + 1.0), f64(exp.success_count) / 100.0]
+				target := if reachability { 1.0 } else { 0.0 }
+				p_item.nn.train_step(feat, target)
+
 				if reachability {
 					exp.success_count++
 					exp.latency = latency
@@ -3684,26 +3766,19 @@ fn watchdog_loop(mut wd Watchdog) {
 					p_item.restart_count++
 					next_cfg := p_item.select_best_config()
 					
-					if is_alive_proc {
-						p_item.proc.signal_kill()
-					}
+					if is_alive_proc { p_item.proc.signal_kill() }
 					p_item.proc.wait() 
 					p_item.proc.close()
 					
 					parts := next_cfg.split(' ').filter(it != '')
 					if parts.len > 0 {
 						mut new_p := os.new_process(parts[0])
-						if parts.len > 1 {
-							new_p.set_args(parts[1..])
-						}
+						if parts.len > 1 { new_p.set_args(parts[1..]) }
 						new_p.run()
-						
 						p_item.proc = new_p
 						p_item.current_cmd = next_cfg
 						p_item.last_restart = time.now()
-
-						println(term.red('\n[ML Watchdog] Connection lost or poor performance.'))
-						println(term.yellow('    -> Switching to: ${next_cfg}'))
+						println(term.yellow('[Neural Watchdog] Switching -> ${next_cfg}'))
 					}
 				}
 			}
