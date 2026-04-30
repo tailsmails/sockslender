@@ -2742,40 +2742,68 @@ fn health_checker(mut app App) {
 }
 
 fn check_chain(c Chain, mut app App) bool {
-    if c.nodes.len == 0 { return false }
-    if c.nodes.len == 1 {
-        n := c.nodes[0]
-        if n.proto == .dns {
-            return check_dns_h(n)
-        }
-    }
-    mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false, mut app) or {
-        return false 
-    }
-    app.safe_close(mut conn)
-    return true
+	if c.nodes.len == 0 { return false }
+	
+	if c.nodes.len == 1 {
+		n := c.nodes[0]
+		match n.proto {
+			.socks5 { return check_socks5_h(n) }
+			.http   { return check_http_h(n) }
+			.sni    { return check_tcp_h(n.addr) }
+			.dns    { return check_dns_h(n) }
+		}
+	}
+	
+	mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false, mut app) or { return false }
+	app.safe_close(mut conn)
+	return true
 }
 
 fn check_tcp_h(addr string) bool {
 	mut c := net.dial_tcp(addr) or { return false }
+	c.set_read_timeout(2 * time.second)
+	c.write([u8(0)]) or { 
+		c.close() or {}
+		return false 
+	}
 	c.close() or {}
 	return true
 }
 
 fn check_socks5_h(n Node) bool {
 	mut c := net.dial_tcp(n.addr) or { return false }
-	c.set_read_timeout(5 * time.second)
-	c.set_write_timeout(5 * time.second)
-	c.close() or {}
-	return true
+	c.set_read_timeout(3 * time.second)
+	c.set_write_timeout(3 * time.second)
+	defer { c.close() or {} }
+
+	// 1. Greeting: [Version, Num Methods, Method (No Auth)]
+	c.write([u8(5), 1, 0]) or { return false }
+	mut buf := []u8{len: 2}
+	c.read(mut buf) or { return false }
+	if buf[0] != 5 || buf[1] != 0 { return false }
+	
+	// [Ver, Cmd(Connect), Rsv, Type(IPv4), IP(1,1,1,1), Port(1,187=443)]
+	c.write([u8(5), 1, 0, 1, 1, 1, 1, 1, 1, 187]) or { return false }
+	mut res := []u8{len: 10}
+	c.read(mut res) or { return false }
+	
+	return res[1] == 0
 }
 
 fn check_http_h(n Node) bool {
 	mut c := net.dial_tcp(n.addr) or { return false }
-	c.set_read_timeout(5 * time.second)
-	c.set_write_timeout(5 * time.second)
-	c.close() or {}
-	return true
+	c.set_read_timeout(3 * time.second)
+	c.set_write_timeout(3 * time.second)
+	defer { c.close() or {} }
+	
+	query := 'CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n'
+	c.write(query.bytes()) or { return false }
+
+	mut buf := []u8{len: 12}
+	c.read(mut buf) or { return false }
+	
+	resp := buf.bytestr()
+	return resp.contains('200')
 }
 
 fn check_dns_h(n Node) bool {
