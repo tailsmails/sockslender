@@ -30,6 +30,14 @@ const check_timeout = 5 * time.second
 const buf_size = 65536
 const dns_sma_lim = 512
 
+struct ConfigExperience {
+mut:
+	score         f64
+	latency       f64
+	success_count int
+	fail_count    int
+}
+
 struct SocketMonitor {
 mut:
 	active_count u32
@@ -321,20 +329,56 @@ fn emergency_monitor(mut app App) {
 }
 
 struct ManagedProcess {
-	cmd        string
-	args[]string
-	check_node Node
-	conf_path  string
 mut:
+	cmd_template  string
+	current_cmd   string
+	args          []string
+	check_node    Node
+	conf_path     string
 	proc          &os.Process
 	last_restart  time.Time
-	restart_count u32
+	restart_count int
+	variations    []string
+	experiences   map[string]ConfigExperience
 }
 
 struct Watchdog {
 mut:
-	procs[]ManagedProcess
+	procs []ManagedProcess
 	mu    sync.Mutex
+	mu_shared  shared sync.Mutex
+}
+
+fn expand_template(template string) []string {
+	mut results := [template]
+	for {
+		start := results[0].index('::') or { break }
+		end := results[0].index_after('::', start + 2) or { break }
+		placeholder := results[0][start..end + 2]
+		
+		content := placeholder[2..placeholder.len - 2]
+		mut options := []string{}
+
+		if content.contains('-') && content.all_before('-').is_int() {
+			s := content.all_before('-').int()
+			e := content.all_after('-').int()
+			step := if e - s > 20 { (e - s) / 5 } else { 1 }
+			for v := s; v <= e; v += step {
+				options << v.str()
+			}
+		} else {
+			options = content.split('-')
+		}
+
+		mut new_results := []string{}
+		for res in results {
+			for opt in options {
+				new_results << res.replace(placeholder, opt)
+			}
+		}
+		results = new_results.clone()
+	}
+	return results
 }
 
 enum ProxyType { socks5 http sni dns }
@@ -2064,38 +2108,42 @@ fn main() {
 				}
 				wd.mu.@lock()
 				for j := 0; j < parts.len; j += 2 {
-					cmd_clean := parts[j].trim_space()
+					cmd_tpl := parts[j].trim_space()
 					endpoint := parts[j + 1].trim_space()
-					if cmd_clean == '' || endpoint == '' {
-						continue
-					}
+					if cmd_tpl == '' || endpoint == '' { continue }
+					variations := expand_template(cmd_tpl)
+					first_cfg := variations[0]
+
 					mut check_node := parse_uri(endpoint) or {
 						parse_uri('sni://' + endpoint) or {
-							eprintln('${term.red("[!]")} [Watchdog] Invalid endpoint format: ${endpoint}')
+							eprintln('${term.red("[!]")} [Watchdog] Invalid endpoint: ${endpoint}')
 							continue
 						}
 					}
-					cmd_parts := cmd_clean.split(' ').filter(it != '')
+
+					cmd_parts := first_cfg.split(' ').filter(it != '')
 					if cmd_parts.len > 0 {
 						mut p := os.new_process(cmd_parts[0])
-						if cmd_parts.len > 1 {
-							p.set_args(cmd_parts[1..])
-						}
+						if cmd_parts.len > 1 { p.set_args(cmd_parts[1..]) }
 						p.run()
+
 						wd.procs << ManagedProcess{
-							cmd: cmd_parts[0]
-							args: cmd_parts[1..]
+							cmd_template: cmd_tpl
+							current_cmd: first_cfg
 							check_node: check_node
 							conf_path: ''
 							proc: p
 							last_restart: time.now()
+							variations: variations
+							experiences: map[string]ConfigExperience{}
 						}
+						
 						pname := match check_node.proto {
 							.socks5 { 'SOCKS5' }
 							.http { 'HTTP' }
 							else { 'TCP' }
 						}
-						println('${term.green("[*]")} [Watchdog] Auto-restarting task added: "${cmd_parts[0]}" -> monitoring ${check_node.addr} via ${pname} handshake')
+						println('${term.green("[ML]")} Auto-Optimizing task added: "${cmd_parts[0]}" (${variations.len} variants) -> monitoring ${check_node.addr} via ${pname}')
 					}
 				}
 				wd.mu.unlock()
@@ -2336,7 +2384,7 @@ fn main() {
 					}
 					wd.mu.@lock()
 					wd.procs << ManagedProcess{
-						cmd: pc_bin
+						current_cmd: pc_bin
 						args: pc_args.clone()
 						check_node: check_node
 						conf_path: conf_path
@@ -2694,19 +2742,18 @@ fn health_checker(mut app App) {
 }
 
 fn check_chain(c Chain, mut app App) bool {
-	if c.nodes.len == 0 { return false }
-	if c.nodes.len == 1 {
-		n := c.nodes[0]
-		match n.proto {
-			.socks5 { return check_socks5_h(n) }
-			.http { return check_http_h(n) }
-			.sni { return check_tcp_h(n.addr) }
-			.dns { return true }
-		}
-	}
-	mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false, mut app) or { return false }
-	app.safe_close(mut conn)
-	return true
+    if c.nodes.len == 0 { return false }
+    if c.nodes.len == 1 {
+        n := c.nodes[0]
+        if n.proto == .dns {
+            return check_dns_h(n)
+        }
+    }
+    mut conn := connect_chain(c.nodes, '1.1.1.1', 443, false, mut app) or {
+        return false 
+    }
+    app.safe_close(mut conn)
+    return true
 }
 
 fn check_tcp_h(addr string) bool {
@@ -3550,87 +3597,88 @@ fn check_internet_via_node(n Node) bool {
 	return false
 }
 
+fn (mut p ManagedProcess) select_best_config() string {
+	if rand.f64() < 0.15 || p.experiences.len < p.variations.len {
+		for v in p.variations {
+			if v !in p.experiences { return v }
+		}
+		return rand.element(p.variations) or { p.current_cmd }
+	}
+	
+	mut best := p.current_cmd
+	mut max_s := -999999.0
+	for cfg, exp in p.experiences {
+		if exp.score > max_s {
+			max_s = exp.score
+			best = cfg
+		}
+	}
+	return best
+}
+
 fn watchdog_loop(mut wd Watchdog) {
 	for {
-		time.sleep(15 * time.second)
+		time.sleep(5 * time.second)
+		
+		for i in 0 .. wd.procs.len {
+			
+			mut p_item := &wd.procs[i]
+			is_alive_proc := p_item.proc.is_alive()
+			
+			mut reachability := false
+			mut latency := 0.0
 
-		wd.mu.@lock()
-		count := wd.procs.len
-		wd.mu.unlock()
+			if is_alive_proc {
+				start_time := time.now()
+				reachability = match p_item.check_node.proto {
+					.socks5 { check_socks5_h(p_item.check_node) }
+					.http   { check_http_h(p_item.check_node) }
+					.sni    { check_tcp_h(p_item.check_node.addr) }
+					.dns    { check_dns_h(p_item.check_node) }
+				}
+				latency = f64((time.now() - start_time).milliseconds())
+			}
+			
+			lock wd.mu_shared {
+				mut exp := p_item.experiences[p_item.current_cmd] or { ConfigExperience{} }
+				
+				if reachability {
+					exp.success_count++
+					exp.latency = latency
+					exp.score = (1500.0 / (latency + 1.0)) + (f64(exp.success_count) * 3.0)
+				} else {
+					exp.score -= 70.0
+					exp.success_count = 0
+				}
+				p_item.experiences[p_item.current_cmd] = exp
+				
+				if !reachability || !is_alive_proc {
+					p_item.restart_count++
+					next_cfg := p_item.select_best_config()
+					
+					if is_alive_proc {
+						p_item.proc.signal_kill()
+					}
+					p_item.proc.wait() 
+					p_item.proc.close()
+					
+					parts := next_cfg.split(' ').filter(it != '')
+					if parts.len > 0 {
+						mut new_p := os.new_process(parts[0])
+						if parts.len > 1 {
+							new_p.set_args(parts[1..])
+						}
+						new_p.run()
+						
+						p_item.proc = new_p
+						p_item.current_cmd = next_cfg
+						p_item.last_restart = time.now()
 
-		for idx in 0 .. count {
-			wd.mu.@lock()
-			if idx >= wd.procs.len {
-				wd.mu.unlock()
-				break
-			}
-			
-			mut p_item := wd.procs[idx]
-			cmd := p_item.cmd
-			args := p_item.args.clone()
-			check_node := p_item.check_node
-			last_restart := p_item.last_restart
-			rc := p_item.restart_count
-			proc_alive := p_item.proc.is_alive()
-			wd.mu.unlock()
-			
-			mut cooldown_secs := i64(30)
-			for _ in 0 .. rc {
-				cooldown_secs *= 2
-				if cooldown_secs > 300 { cooldown_secs = 300; break }
-			}
-			if time.now() - last_restart < cooldown_secs * time.second {
-				continue
-			}
-			
-			mut alive := true
-			if !proc_alive {
-				alive = false
-			} else {
-				match check_node.proto {
-					.socks5 { alive = check_socks5_h(check_node) }
-					.http   { alive = check_http_h(check_node) }
-					.sni    { alive = check_tcp_h(check_node.addr) }
-					.dns    { alive = check_dns_h(check_node) }
+						println(term.red('\n[ML Watchdog] Connection lost or poor performance.'))
+						println(term.yellow('    -> Switching to: ${next_cfg}'))
+					}
 				}
 			}
-			if alive {
-				if rc > 0 {
-					wd.mu.@lock()
-					if idx < wd.procs.len { wd.procs[idx].restart_count = 0 }
-					wd.mu.unlock()
-				}
-				continue
-			}
-			wd.mu.@lock()
-			if idx >= wd.procs.len {
-				wd.mu.unlock()
-				break
-			}
-			
-			new_rc := wd.procs[idx].restart_count + 1
-			
-			if proc_alive {
-				println('\n${term.red("[!]")} [Watchdog] NO INTERNET: "${cmd}" is running but cannot reach 1.1.1.1 (Restart #${new_rc})')
-			} else {
-				println('\n${term.red("[!]")} [Watchdog] CRASH: "${cmd}" died (Restart #${new_rc})')
-			}
-			if wd.procs[idx].proc.is_alive() {
-				wd.procs[idx].proc.signal_kill()
-			}
-			wd.procs[idx].proc.wait()
-			wd.procs[idx].proc.close()
-			mut new_p := os.new_process(cmd)
-			if args.len > 0 {
-				new_p.set_args(args)
-			}
-			new_p.run()
-			wd.procs[idx].proc = new_p
-			wd.procs[idx].last_restart = time.now()
-			wd.procs[idx].restart_count = new_rc
-			
-			println('    -> Restarted (PID: ${new_p.pid}). Waiting ${cooldown_secs}s for next check.')
-			wd.mu.unlock()
 		}
 	}
 }
