@@ -368,7 +368,7 @@ fn expand_template(template string) []string {
 				options << v.str()
 			}
 		} else {
-			options = content.split('-')
+			options = content.split('>')
 		}
 
 		mut new_results := []string{}
