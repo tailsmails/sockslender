@@ -13,7 +13,7 @@ SockSlender is a programmable proxy multiplexer. It combines multiple proxy serv
 ## Quick Install
 
 ```sh
-apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/sockslender && cd sockslender && v -enable-globals -prod sockslender.v -o sockslender && ln -sf $(pwd)/sockslender $PREFIX/bin/sockslender
+apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/sockslender && cd sockslender && v -enable-globals sockslender.v -o sockslender && ln -sf $(pwd)/sockslender $PREFIX/bin/sockslender
 ```
 
 ## Core Capabilities
